@@ -1,4 +1,5 @@
 import { call, esc } from "./common.js";
+import { merge3, applyInPlace, clone, deepEq } from "./merge.js";
 import {
   CAMPAIGN_FIELDS, SESSION_FIELDS, blankSession, normalizeDoc, sharedView, buildReport, prettyDate, planCounts, planHasContent,
 } from "./campaign.js";
@@ -34,6 +35,28 @@ export function mountCampaign(root, { room, pin, toast, onShared, addToMap, getL
   const dlg = root.querySelector(".campdlg");
 
   /* ----- saving ----- */
+  let base = null;   // the campaign as the server last had it, so another screen's changes can be merged with ours
+  let lastTyped = 0;
+  root.addEventListener("input", () => { lastTyped = Date.now(); });
+  /* Another screen saved first: merge its copy with ours. Returns true if we still hold changes it doesn't have. */
+  function reconcile(raw) {
+    const theirs = normalizeDoc(raw);
+    const merged = merge3(base || theirs, doc, theirs);
+    merged.rev = theirs.rev;
+    const stillOurs = !deepEq({ ...merged, rev: 0 }, { ...theirs, rev: 0 });
+    applyInPlace(doc, merged);
+    base = clone(theirs);
+    if (!doc.sessions.some((s) => s.id === selId)) selId = sorted()[0]?.id || "";
+    render();
+    return stillOurs;
+  }
+  async function refresh() {
+    if (!doc || saving || dirty) return;
+    if (Date.now() - lastTyped < 3000) return;   // someone is typing here right now: try again later
+    const r = await call(`campdoc/${room}`, { pin }).catch(() => null);
+    if (!r || !doc || saving || dirty || r.doc.rev === doc.rev) return;
+    if (reconcile(r.doc)) touch();
+  }
   const setStatus = (s) => { status = s; root.querySelector("[data-status]").textContent = STATUS[s]; };
 
   function touch() {
@@ -48,14 +71,15 @@ export function mountCampaign(root, { room, pin, toast, onShared, addToMap, getL
     saving = true; dirty = false;
     let failed = false;
     try {
-      const r = await call(`campdoc/${room}`, { method: "PUT", body: { doc }, pin });
-      doc.rev = r.rev;
+      const sent = clone(doc);
+      const r = await call(`campdoc/${room}`, { method: "PUT", body: { doc: sent }, pin });
+      doc.rev = r.rev; sent.rev = r.rev; base = sent;
       if (!dirty) setStatus("saved");
       const key = JSON.stringify(sharedView(doc));
       if (key !== lastShared) { lastShared = key; onShared?.(r.rev); }
     } catch (err) {
-      failed = true; dirty = true;
-      setStatus("error");
+      if (err.status === 409 && err.data?.doc) { reconcile(err.data.doc); dirty = true; }   // the other screen got there first: merge, then send again
+      else { failed = true; dirty = true; setStatus("error"); }
     } finally {
       saving = false;
       if (dirty) { clearTimeout(timer); timer = setTimeout(flush, failed ? 2500 : 200); }
@@ -298,11 +322,12 @@ export function mountCampaign(root, { room, pin, toast, onShared, addToMap, getL
       render();
       return;
     }
+    base = clone(doc);
     lastShared = JSON.stringify(sharedView(doc));
     selId = sorted()[0]?.id || "";
     render();
   }
 
   render();
-  return { load, loaded: () => !!doc, flushNow: flush };
+  return { load, refresh, rev: () => doc?.rev ?? null, loaded: () => !!doc, flushNow: flush };
 }

@@ -110,9 +110,10 @@ function publicView(s) {
   const init = s.init || {};
   return {
     ...s,
+    ver: undefined,   // (the DM screens' sync counter)
     ents,
     inv,
-    objectives: (s.objectives || []).filter((o) => !o.hidden),
+    objectives: (s.objectives || []).filter((o) => !o.hidden).map(({ loc, ...o }) => o),   // which saved map an objective is tied to is the DM's business
     init: {
       ...init,
       list: (init.list || []).filter((i) => visible.has(i.id)),
@@ -291,7 +292,7 @@ function cleanPlan(p) {
   const id = (x) => cleanId(x?.id) || Math.random().toString(36).slice(2, 9);
   return {
     goal: str(p.goal, 4000), strongStart: str(p.strongStart, 4000), notes: str(p.notes, 8000),
-    beats: list(p.beats, 80, (b) => ({ id: id(b), text: str(b.text, 1500), kind: BEAT_KINDS.includes(b.kind) ? b.kind : "scene", note: str(b.note, 3000), done: !!b.done })),
+    beats: list(p.beats, 80, (b) => ({ id: id(b), locId: cleanId(b.locId), text: str(b.text, 1500), kind: BEAT_KINDS.includes(b.kind) ? b.kind : "scene", note: str(b.note, 3000), done: !!b.done })),
     secrets: list(p.secrets, 80, (b) => ({ id: id(b), text: str(b.text, 1500), done: !!b.done })),
     places: list(p.places, 40, (b) => ({ id: id(b), name: str(b.name, 80), notes: str(b.notes, 3000), locId: cleanId(b.locId) })),
     npcs: list(p.npcs, 60, (b) => ({ id: id(b), lib: cleanId(b.lib), name: str(b.name, 80), role: str(b.role, 120), wants: str(b.wants, 1000), secret: str(b.secret, 1000), voice: str(b.voice, 500), notes: str(b.notes, 3000) })),
@@ -710,8 +711,33 @@ export default async (req) => {
       let s;
       try { s = JSON.parse(text); } catch { return fail(400, "Bad data."); }
       if (!s || !Array.isArray(s.ents)) return fail(400, "Bad data.");
-      await store.setJSON(`state/${room}`, s);
-      return reply({ ok: true, rev: s.rev });
+      // Two DM screens can be open at once. Each save says which version it was built on; if the table has moved on since,
+      // the save is turned away along with the current copy, and the screen merges its changes into that.
+      const prev = await store.get(`state/${room}`, { type: "json" });
+      const prevVer = Number(prev?.ver) || 0;
+      if (s.ver !== undefined && Number(s.ver) !== prevVer) return reply({ error: "The table changed on another screen.", state: prev }, 409);
+      s.ver = prevVer + 1;
+      s.rev = Math.max(Number(s.rev) || 0, (Number(prev?.rev) || 0) + 1);   // players notice a new rev
+      await store.setJSON(`state/${room}`, s, { metadata: { ver: s.ver } });
+      return reply({ ok: true, ver: s.ver, rev: s.rev });
+    }
+    // A DM screen asks "has anything changed since version N?" and gets the whole table only if it has.
+    if (route === "dmstate" && req.method === "GET") {
+      const denied = await dmOnly();
+      if (denied) return denied;
+      const s = await store.get(`state/${room}`, { type: "json" });
+      if (!s) return fail(404, "No table with that code.");
+      const v = url.searchParams.get("ver");
+      if (v !== null && Number(v) === (Number(s.ver) || 0)) return reply({ same: true, ver: Number(s.ver) || 0 });
+      return reply({ state: s });
+    }
+    // The versions of the other saved documents, so a screen knows when to fetch one again (a cheap look, not a full read).
+    if (route === "versions" && req.method === "GET") {
+      const denied = await dmOnly();
+      if (denied) return denied;
+      const meta = async (key) => (await store.getMetadata(key).catch(() => null))?.metadata || {};
+      const [st, lo, ca, be] = await Promise.all([meta(`state/${room}`), meta(`locs/${room}`), meta(`camp/${room}`), meta(`bestiary/${room}`)]);
+      return reply({ state: st.ver ?? null, locs: lo.rev ?? null, camp: ca.rev ?? null, bestiary: be.rev ?? null });
     }
 
     // Binary assets: maps and fog masks (one set per saved location; no id means the original single map),
@@ -932,8 +958,9 @@ export default async (req) => {
       if (text.length > 800000) return fail(413, "The saved locations are too large.");
       let body;
       try { body = JSON.parse(text); } catch { return fail(400, "Bad data."); }
+      if (Number.isFinite(Number(body.doc?.rev)) && body.doc?.rev !== undefined && Number(body.doc.rev) !== (prev?.rev || 0)) return reply({ error: "The saved locations changed on another screen.", doc: { ...cleanLocs(prev), rev: prev?.rev || 0 } }, 409);
       const rev = (prev?.rev || 0) + 1;
-      await store.setJSON(`locs/${room}`, { ...cleanLocs(body.doc), rev });
+      await store.setJSON(`locs/${room}`, { ...cleanLocs(body.doc), rev }, { metadata: { rev } });
       return reply({ ok: true, rev });
     }
 
@@ -949,8 +976,9 @@ export default async (req) => {
       if (text.length > 1500000) return fail(413, "The campaign document is too large.");
       let body;
       try { body = JSON.parse(text); } catch { return fail(400, "Bad data."); }
+      if (body.doc?.rev !== undefined && Number.isFinite(Number(body.doc.rev)) && Number(body.doc.rev) !== (prev?.rev || 0)) return reply({ error: "The campaign changed on another screen.", doc: readCamp(prev) }, 409);
       const rev = (prev?.rev || 0) + 1;
-      await store.setJSON(`camp/${room}`, { ...cleanCamp(body.doc), rev });
+      await store.setJSON(`camp/${room}`, { ...cleanCamp(body.doc), rev }, { metadata: { rev } });
       return reply({ ok: true, rev });
     }
 
@@ -963,8 +991,9 @@ export default async (req) => {
       if (text.length > 3500000) return fail(413, "The library is too large.");
       let body;
       try { body = JSON.parse(text); } catch { return fail(400, "Bad data."); }
+      if (body.doc?.rev !== undefined && Number.isFinite(Number(body.doc.rev)) && Number(body.doc.rev) !== (prev?.rev || 0)) return reply({ error: "The library changed on another screen.", doc: readBestiary(prev) }, 409);
       const rev = (prev?.rev || 0) + 1;
-      await store.setJSON(`bestiary/${room}`, { ...cleanCreatures(body.doc), rev });
+      await store.setJSON(`bestiary/${room}`, { ...cleanCreatures(body.doc), rev }, { metadata: { rev } });
       return reply({ ok: true, rev });
     }
 

@@ -1,3 +1,4 @@
+import { merge3, applyInPlace, deepEq } from "./merge.js";   // (this file has its own clone)
 import { call, esc, uid, clamp } from "./common.js";
 import { compressMap, makeThumb, MAP_ACCEPT } from "./images.js";
 
@@ -53,6 +54,7 @@ export function mountLocations(root, ctx) {
   const { room, pin } = ctx;
   const imgs = ctx.images || { compressMap, makeThumb };
   let doc = null, loadFailed = false, timer = null, saving = false, dirty = false;
+  let base = null;                // the list as the server last had it, so another screen's changes can be merged with ours
   const keys = new Map();         // location id -> last saved snapshot (so we only save real changes)
   const localUrls = new Map();    // location id -> { rev, url } for maps just uploaded from this screen
   const S = () => ctx.state();
@@ -75,17 +77,36 @@ export function mountLocations(root, ctx) {
   const status = (t, bad = false) => { const el = root.querySelector("[data-status]"); el.textContent = t; el.classList.toggle("bad", bad); };
 
   /* ----- saving the list ----- */
+  /* What we remember about each saved location, so we only save real changes. */
+  const setKeys = () => { for (const l of doc.locations) keys.set(l.id, JSON.stringify({ mapRev: l.mapRev, mapW: l.mapW, mapH: l.mapH, mapKind: l.mapKind || "", grid: l.grid, fog: l.fog, tokens: l.tokens })); };
+
+  /* Another screen saved the list first: merge its copy with ours. Returns true if we still hold changes it doesn't have. */
+  function reconcile(theirs) {
+    const merged = merge3(base || theirs, doc, theirs);
+    merged.rev = theirs.rev;
+    const stillOurs = !deepEq({ ...merged, rev: 0 }, { ...theirs, rev: 0 });
+    applyInPlace(doc, merged);
+    base = clone(theirs);
+    setKeys();
+    render();
+    return stillOurs;
+  }
+
   async function saveDoc() {
     if (saving) { dirty = true; return; }
     saving = true; dirty = false;
     status("Saving…");
     try {
-      const r = await call(`locs/${room}`, { method: "PUT", body: { doc }, pin });
-      doc.rev = r.rev;
+      const sent = clone(doc);
+      const r = await call(`locs/${room}`, { method: "PUT", body: { doc: sent }, pin });
+      doc.rev = r.rev; sent.rev = r.rev; base = sent;
       status("Saved");
     } catch (err) {
-      status("Not saved", true);
-      ctx.toast?.("Could not save your locations: " + err.message);
+      if (err.status === 409 && err.data?.doc) { reconcile(err.data.doc); dirty = true; }   // the other screen got there first: merge, then send again
+      else {
+        status("Not saved", true);
+        ctx.toast?.("Could not save your locations: " + err.message);
+      }
     } finally {
       saving = false;
       if (dirty) saveDoc();
@@ -147,6 +168,13 @@ export function mountLocations(root, ctx) {
         : '<p class="empty">No locations yet. Add one with a map image, then switch between them any time.</p>'}`;
   }
 
+  /* What is tied to a location: the beats, places and objectives that point at it. The page works these out (ctx.links) and tapping one jumps there. */
+  const LINK_LABEL = { beat: "Beat", place: "Place", objective: "Objective" };
+  const linksHTML = (id) => {
+    const ls = ctx.links?.(id) || [];
+    if (!ls.length) return "";
+    return `<ul class="loclinks" aria-label="Tied to this location">${ls.map((x, i) => `<li><button type="button" class="lk" data-lk="${i}" title="Open it"><span class="lkk ${x.kind}">${LINK_LABEL[x.kind] || x.kind}</span> ${esc(x.text)}${x.sub ? ` <small>${esc(x.sub)}</small>` : ""}</button></li>`).join("")}</ul>`;
+  };
   const card = (l, isActive) => `
     <li class="loccard ${isActive ? "on" : ""}" data-id="${l.id}">
       <div class="locthumb">${l.thumbRev ? `<img src="${thumbUrl(l)}" alt="" loading="lazy">` : '<span class="hint">No preview</span>'}
@@ -154,6 +182,7 @@ export function mountLocations(root, ctx) {
       <div class="locinfo">
         <h3>${esc(l.name)}</h3>
         ${l.notes ? `<p>${esc(l.notes.length > 110 ? l.notes.slice(0, 110) + "…" : l.notes)}</p>` : ""}
+        ${linksHTML(l.id)}
       </div>
       <div class="locact">
         <button class="btn small primary" type="button" data-act="load" ${isActive ? "disabled" : ""}>${isActive ? "Current" : "Go here"}</button>
@@ -405,6 +434,12 @@ export function mountLocations(root, ctx) {
 
   /* ----- events ----- */
   root.addEventListener("click", (e) => {
+    const lk = e.target.closest("[data-lk]");   // a beat, place or objective tied to this location
+    if (lk) {
+      const x = (ctx.links?.(lk.closest("[data-id]")?.dataset.id) || [])[Number(lk.dataset.lk)];
+      if (x) ctx.jump?.(x);
+      return;
+    }
     const b = e.target.closest("[data-act]");
     if (!b) return;
     const id = b.closest("[data-id]")?.dataset.id;
@@ -429,7 +464,8 @@ export function mountLocations(root, ctx) {
     try {
       doc = (await call(`locs/${room}`, { pin })).doc;
       loadFailed = false;
-      for (const l of doc.locations) keys.set(l.id, JSON.stringify({ mapRev: l.mapRev, mapW: l.mapW, mapH: l.mapH, mapKind: l.mapKind || "", grid: l.grid, fog: l.fog, tokens: l.tokens }));
+      base = clone(doc);
+      setKeys();
     } catch (err) {
       doc = null; loadFailed = true;
       ctx.toast?.("Could not load your locations: " + err.message);
@@ -437,8 +473,16 @@ export function mountLocations(root, ctx) {
     render();
   }
 
+  /* The other screen changed the saved locations: bring its copy in. */
+  async function refresh() {
+    if (!doc || saving) return;
+    const r = await call(`locs/${room}`, { pin }).catch(() => null);
+    if (!r || !doc || saving || r.doc.rev === doc.rev) return;
+    if (reconcile(r.doc)) saveDoc();
+  }
+
   render();
-  return { load, touch, uploadMap, render, refreshQuick: renderQuick, active, createLocation, switchTo,
+  return { load, refresh, rev: () => doc?.rev ?? null, touch, uploadMap, render, refreshQuick: renderQuick, active, createLocation, switchTo,
     list: () => (doc ? doc.locations.map((l) => ({ id: l.id, name: l.name })) : []),   // for a session plan to link to saved maps
     openSwitch: (id) => switchDialog(id), deleteLocation, saveCurrent, flush: async () => { if (syncActive()) await saveDoc(); } };
 }

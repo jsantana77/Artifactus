@@ -1,4 +1,5 @@
 import { call, esc, uid } from "./common.js";
+import { merge3, applyInPlace, clone, deepEq } from "./merge.js";
 import { mod } from "./charsheet.js";
 import { d20Btn, barHTML, skillsHTML, parseSaves, rollifyText, bindCardRolls } from "./creaturerolls.js";
 import { sg, ord, crValue, profByCr, diceAvg, ATTACK_KINDS, FEATURE_TYPES, ABIL_NAMES, normalizeStats, blankAttack, blankFeature, blankSpell, blankSpellcasting, structuredSections, statSummary, bindOpenState } from "./statblock.js";
@@ -95,6 +96,27 @@ export function mountCreatures(root, { room, pin, toast, addToMap, showTab, spel
   doc0.body.appendChild(dlg);
 
   /* ----- saving ----- */
+  let base = null;   // the library as the server last had it, so another screen's changes can be merged with ours
+  const theirDoc = (d) => ({ rev: d.rev || 0, creatures: (d.creatures || []).map(normalizeStats) });
+  /* Another screen saved first: merge its copy with ours. Returns true if we still hold changes it doesn't have. */
+  function reconcile(raw) {
+    const theirs = theirDoc(raw);
+    const merged = merge3(base || theirs, doc, theirs);
+    merged.rev = theirs.rev;
+    const stillOurs = !deepEq({ ...merged, rev: 0 }, { ...theirs, rev: 0 });
+    applyInPlace(doc, merged);
+    base = clone(theirs);
+    if (!current()) selId = visible()[0]?.id || "";
+    renderList();
+    if (!editEl.contains(editEl.ownerDocument.activeElement)) renderEdit();   // (not while someone is typing in it)
+    return stillOurs;
+  }
+  async function refresh() {
+    if (!doc || saving) return;
+    const r = await call(`bestiary/${room}`, { pin }).catch(() => null);
+    if (!r || !doc || saving || (r.doc.rev || 0) === doc.rev) return;
+    if (reconcile(r.doc)) touch();
+  }
   const setStatus = (s) => { status = s; root.querySelector("[data-status]").textContent = STATUS[s]; };
   function touch() {
     dirty = true;
@@ -107,12 +129,13 @@ export function mountCreatures(root, { room, pin, toast, addToMap, showTab, spel
     saving = true; dirty = false;
     let failed = false;
     try {
-      const r = await call(`bestiary/${room}`, { method: "PUT", body: { doc }, pin });
-      doc.rev = r.rev;
+      const sent = clone(doc);
+      const r = await call(`bestiary/${room}`, { method: "PUT", body: { doc: sent }, pin });
+      doc.rev = r.rev; sent.rev = r.rev; base = sent;
       if (!dirty) setStatus("saved");
-    } catch {
-      failed = true; dirty = true;
-      setStatus("error");
+    } catch (err) {
+      if (err.status === 409 && err.data?.doc) { reconcile(err.data.doc); dirty = true; }   // the other screen got there first: merge, then send again
+      else { failed = true; dirty = true; setStatus("error"); }
     } finally {
       saving = false;
       if (dirty) { clearTimeout(timer); timer = setTimeout(flush, failed ? 2500 : 200); }
@@ -553,7 +576,8 @@ export function mountCreatures(root, { room, pin, toast, addToMap, showTab, spel
   async function load() {
     try {
       const r = await call(`bestiary/${room}`, { pin });
-      doc = { rev: r.doc.rev || 0, creatures: (r.doc.creatures || []).map(normalizeStats) };
+      doc = theirDoc(r.doc);
+      base = clone(doc);
       loadError = "";
       if (!current()) selId = visible()[0]?.id || "";
     } catch (err) {
@@ -570,6 +594,8 @@ export function mountCreatures(root, { room, pin, toast, addToMap, showTab, spel
   /* ----- for the rest of the page ----- */
   return {
     load: ensureLoaded,
+    refresh,
+    rev: () => doc?.rev ?? null,
     /* Open a creature's stat block card. Resolves to false if it's no longer in the library. */
     async card(id, who = "") {
       await ensureLoaded();

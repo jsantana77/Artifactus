@@ -39,6 +39,11 @@
     <span class="code" id="code" title="Table code"></span>
     <button class="btn small" id="copyLink" type="button">Copy player link</button>
     <button class="btn small" id="popMap" type="button" title="Open the map in its own window so you can put it on a second screen">Map on 2nd screen</button>
+    <select class="btn small" id="viewSel" aria-label="What this screen shows" title="What this screen shows. Use a different one on each device (a laptop and an iPad, say): they stay in step with each other.">
+      <option value="full">Everything</option>
+      <option value="combat">Combat screen</option>
+      <option value="map">Map screen</option>
+    </select>
     <nav class="tabs" role="tablist" aria-label="Views">
       <button role="tab" id="tabMap" aria-selected="true">Map</button>
       <button role="tab" id="tabInv" aria-selected="false">Inventory</button>
@@ -120,6 +125,7 @@
     <section class="pane" id="paneParty" hidden>
       <div class="maptools">
         <button class="btn small" id="libBtn" type="button">Spell library</button>
+        <button class="btn small primary" id="levelParty" type="button" title="Raise the level of some or all of the party at once">Level up the party…</button>
         <span class="hint" id="libInfo"></span>
         <span class="hint">Give each player a PIN under "Player login" so they sign in to their own character.</span>
       </div>
@@ -145,6 +151,8 @@
       </div>
     </section>
   </main>
+
+  <div id="viewHost" hidden></div>
 
   <aside class="side">
     <section class="card" id="joinCard">

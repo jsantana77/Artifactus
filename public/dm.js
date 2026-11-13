@@ -1,13 +1,15 @@
 import { call, uid, esc, clamp, TYPES, OBJECT_ICONS, OBJECT_SHAPES, OBJECT_TINTS, OBJECT_PRESETS, STRUCT_SHAPES, MapView, pingColor, PING_TTL, defaultPersp, FT_PER_SQUARE, turnKey, MIN_SQUARE, autoLineWidth, OBJECT_MIN, OBJECT_MAX, PERSON_MIN, PERSON_MAX } from "./common.js";
-import { mountRoller } from "./dice.js";
+import { mountRoller, rand } from "./dice.js";
 import { SheetStore, mountBook, mountNotes, blankSheet } from "./sheet.js";
 import { Library, parseSpells } from "./library.js";
 import { openPopout } from "./popout.js";
-import { mountChar } from "./charsheet.js";
+import { mountChar, charOf, mod, profBonus } from "./charsheet.js";
+import { classInfo, slotsFor, slotText, hpPerLevel, hitDiceFor, LEVEL_MAX } from "./levelup.js";
 import { mountCampaign } from "./campaign-ui.js";
 import { mountCreatures } from "./creatures.js";
 import { mountCombatPanel, pcCardHTML, pcStats, partyGlanceHTML, bindOpenState } from "./combat.js";
 import { refreshRollBars } from "./creaturerolls.js";
+import { merge3, applyInPlace, clone, deepEq } from "./merge.js";
 import { mountLocations } from "./locations.js";
 
 const popDocs = new Set();   // the pages of any pop-out windows (the map, the combat window) that are open
@@ -100,16 +102,112 @@ function scheduleSave(delay = 250) {
   timer = setTimeout(() => { timer = null; flush(); }, delay);
 }
 
+/* ---------- two DM screens at once ----------
+   Every save says which version of the table it was built on (state.ver). If the other screen saved first, the server turns this one
+   away with its current copy, and we merge our changes into it (see merge.js) and save again. We also ask the server every couple of
+   seconds whether the other screen changed anything. `synced` is the last copy we know the server has. */
+let synced = null;
+const unsaved = () => dirty || saving || timer;
+
+/* Fill in anything an older or newer copy of the table lacks, so the rest of the page can count on it. It is applied to every copy we
+   compare (ours, the server's, and the one we last synced), so a missing value and its default never look like a difference. */
+function normalizeState(s = state) {
+  s.ver ??= 0;   // (a table saved before two-screen editing has no version yet)
+  s.ents ||= []; s.inv ||= {}; s.init ||= { list: [], turnId: null, round: 1, on: false };
+  s.grid ||= { on: false, size: 60, snap: false };
+  s.fog ||= { on: false, rev: 0 };
+  s.grid.opacity ??= 0.3;
+  s.grid.ox ||= 0; s.grid.oy ||= 0;
+  s.grid.areas ||= [];
+  s.feedOn ??= false;
+  s.campRev ??= 0;
+  s.freeExplore ??= false;
+  s.autoJoin ??= false;
+  s.autoApprove ??= false;
+  s.moveResults ||= {};
+  s.locId ??= "";
+  s.locName ??= "";
+  s.objectives ||= [];
+  s.inv.stash ||= []; s.inv.dm ||= [];
+  return s;
+}
+
+/* Bring the other screen's copy into ours, keeping our own unsaved changes. Returns true if something on screen should be redrawn. */
+function absorb(raw) {
+  const theirs = normalizeState(clone(raw));
+  const mine = clone(state);
+  const merged = merge3(synced || theirs, mine, theirs);
+  merged.ver = theirs.ver;
+  merged.rev = Math.max(Number(mine.rev) || 0, Number(theirs.rev) || 0);
+  const stillOurs = !deepEq({ ...merged, rev: 0 }, { ...theirs, rev: 0 });   // do we hold changes the server doesn't have?
+  const visible = applyInPlace(state, merged);
+  normalizeState();
+  synced = clone(theirs);
+  if (stillOurs) dirty = true;
+  return visible;
+}
+
+/* Redraw everything the way changed() does, without counting it as one of our own changes. */
+function renderRemote() {
+  renderMap();
+  renderSide();
+  if (tab === "inv") renderInv();
+  if (tab === "party") { renderParty(); renderGlance(); }
+  if (tab === "obj") renderObjectives();
+  if (tab === "loc") locs?.render();
+}
+
+let pointerDown = false;
+for (const [ev, v] of [["pointerdown", true], ["pointerup", false], ["pointercancel", false]]) window.addEventListener(ev, () => { pointerDown = v; }, true);
+window.addEventListener("blur", () => { pointerDown = false; });
+
+let pollBusy = false;
+async function pollState() {
+  if (!state || !synced || pollBusy || saving || document.hidden) return;
+  if (pointerDown || fogPending) return;   // never move things under a finger, or over fog that is still being painted
+  pollBusy = true;
+  try {
+    const r = await call(`dmstate/${room}?ver=${state.ver || 0}`, { pin });
+    if (r.same || !r.state || saving || pointerDown || fogPending) return;
+    if (absorb(r.state)) renderRemote();
+    if (dirty) scheduleSave();
+  } catch { /* offline: the next poll tries again */ }
+  finally { pollBusy = false; }
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { pollState(); pollVersions(); } });
+
+/* The saved locations, campaign and NPC library: a quick look at their versions, and a refresh of any the other screen changed. */
+async function pollVersions() {
+  if (document.hidden || !state) return;
+  try {
+    const v = await call(`versions/${room}`, { pin });
+    for (const [key, mod] of [["locs", locs], ["camp", campaign], ["bestiary", creatures]]) {
+      const mine = mod?.rev?.();
+      if (v[key] != null && mine != null && v[key] !== mine) mod.refresh();
+    }
+  } catch { /* try again next time */ }
+}
+
 async function flush() {
   if (saving || !dirty) return;
   saving = true; dirty = false;
   let failed = false;
   try {
-    await call(`state/${room}`, { method: "PUT", body: state, pin });
+    const sent = clone(state);   // exactly what we send, so we know what the server will hold
+    const r = await call(`state/${room}`, { method: "PUT", body: sent, pin });
+    sent.ver = r.ver; sent.rev = r.rev;
+    synced = sent;
+    state.ver = r.ver;
+    if (r.rev > (state.rev || 0)) state.rev = r.rev;
     if (!dirty) setSync("Saved");
   } catch (err) {
-    failed = true; dirty = true;
-    setSync(err.status === 401 ? "Wrong PIN" : "Offline, retrying…", true);
+    if (err.status === 409 && err.data?.state) {
+      if (absorb(err.data.state)) renderRemote();   // the other screen got there first: merge, then send again
+      dirty = true;
+    } else {
+      failed = true; dirty = true;
+      setSync(err.status === 401 ? "Wrong PIN" : "Offline, retrying…", true);
+    }
   } finally {
     saving = false;
     if (dirty && !timer) scheduleSave(failed ? 2500 : 60);
@@ -382,7 +480,35 @@ function setTab(t) {
   if (t === "obj") renderObjectives();
   if (t === "camp") ensureCampaign();
   if (t === "crea") ensureCreatures();
-  if (t === "loc") locs?.render();
+  if (t === "loc") { locs?.render(); refreshLocLinks(); }
+}
+
+/* ---------- what is tied to each saved location ---------- */
+let locLinks = new Map();   // location id -> [{ kind: "beat" | "place" | "objective", text, sub, id }]
+async function refreshLocLinks() {
+  const map = new Map();
+  const add = (loc, item) => { if (loc) { if (!map.has(loc)) map.set(loc, []); map.get(loc).push(item); } };
+  for (const o of state?.objectives || []) add(o.loc, { kind: "objective", id: o.id, text: o.title || "Untitled objective", sub: o.hidden ? "hidden from players" : "" });
+  try {
+    await campaign?.flushNow?.();   // (so a beat that was just edited is counted)
+    const r = await call(`campdoc/${room}`, { pin });
+    for (const s of r.doc.sessions || []) {
+      const label = `Session ${s.number}${s.title ? " · " + s.title : ""}`;
+      for (const b of s.plan?.beats || []) add(b.locId, { kind: "beat", id: s.id, text: String(b.text || "").slice(0, 80) || "(empty beat)", sub: label });
+      for (const p of s.plan?.places || []) add(p.locId, { kind: "place", id: s.id, text: p.name || "(unnamed place)", sub: label });
+    }
+  } catch { /* the objectives still show */ }
+  locLinks = map;
+  if (tab === "loc") locs?.render();
+}
+function jumpToLink(x) {
+  if (x.kind === "objective") {
+    setTab("obj");
+    const card = $(`#objList .obj[data-id="${x.id}"]`);
+    card?.scrollIntoView?.({ block: "center" });
+    card?.classList.add("flash");
+    setTimeout(() => card?.classList.remove("flash"), 1600);
+  } else setTab("camp");   // beats and places live in a session's plan
 }
 
 /* ---------- the map on a second screen ---------- */
@@ -465,26 +591,57 @@ async function openCombat() {
       toast("The combat window didn't open. Allow pop-ups for this site, then try again.");
       return;
     }
-    combatCtl = ctl;
-    combatDoc = ctl.doc;
-    popDocs.add(combatDoc);
+    popDocs.add(ctl.doc);
     initHolder.hidden = false;
     $("#popInit").hidden = true;   // (it's in the window now)
-    combatPanel = mountCombatPanel(statsEl, {
-      onMode(m) { combatMode = m === "all" ? "all" : "turn"; localStorage.setItem("combatMode", combatMode); renderCombat(); },
-      onUnpin() { pinnedId = ""; renderCombat(); },
-      onHp(id, delta) { applyHp(id, delta); },
-      onHpDialog(id) { hpDialog(id); },
-      onLink(id, cid) { const e = ent(id); if (e) { e.cid = cid; changed(); } },
-      rolls: rollHooks,
-    });
-    loadPcSheets();
-    combatTimer = setInterval(loadPcSheets, 5000);
-    renderInit();
-    renderCombat();
+    startCombatPanel(statsEl, ctl);
     toast("Combat is open in its own window. Drag it to your other screen.");
   } finally { combatBusy = false; }
 }
+
+/* The tracker's stat blocks, live: in a window of their own, or (on the combat screen) the whole page. */
+function startCombatPanel(statsEl, ctl) {
+  combatCtl = ctl;
+  combatDoc = ctl.doc;
+  combatPanel = mountCombatPanel(statsEl, {
+    onMode(m) { combatMode = m === "all" ? "all" : "turn"; localStorage.setItem("combatMode", combatMode); renderCombat(); },
+    onUnpin() { pinnedId = ""; renderCombat(); },
+    onHp(id, delta) { applyHp(id, delta); },
+    onHpDialog(id) { hpDialog(id); },
+    onLink(id, cid) { const e = ent(id); if (e) { e.cid = cid; changed(); } },
+    rolls: rollHooks,
+  });
+  loadPcSheets();
+  combatTimer = setInterval(loadPcSheets, 5000);
+  renderInit();
+  renderCombat();
+}
+
+/* This whole screen is the combat tracker and the stat blocks (a tablet beside the laptop, say). */
+function enterCombatView() {
+  const host = $("#viewHost");
+  const wrap = document.createElement("div");
+  wrap.className = "combatwin";
+  const statsEl = document.createElement("section");
+  statsEl.className = "combatstats";
+  wrap.append(initCard, statsEl);
+  host.append(wrap);
+  host.hidden = false;
+  $("#popInit").hidden = true;
+  startCombatPanel(statsEl, { doc: document, focus() {}, close() {} });
+}
+
+/* ---------- what this screen shows ---------- */
+const VIEWS = ["full", "combat", "map"];
+const VIEW = (() => { const v = new URLSearchParams(location.search).get("view") || localStorage.getItem("dmView") || "full"; return VIEWS.includes(v) ? v : "full"; })();
+document.body.dataset.view = VIEW;
+$("#viewSel").value = VIEW;
+$("#viewSel").onchange = (e) => {
+  localStorage.setItem("dmView", e.target.value);   // (remembered on this device only)
+  const u = new URL(location.href);
+  u.searchParams.delete("view");
+  location.href = u.toString();
+};
 
 function onCombatClosed(wrap, statsEl) {
   clearInterval(combatTimer);
@@ -1158,7 +1315,7 @@ function renderParty() {
       const el = document.createElement("section");
       el.className = "pcard";
       el.dataset.pid = pc.id;
-      el.innerHTML = '<div class="pchead"><h2></h2><span class="lock"></span><button class="btn small" data-act="login" type="button">Player login</button></div><details class="notesbox" open><summary>Overview (read-only)</summary><div class="povr"></div></details><div class="book"></div><details class="notesbox"><summary>Character sheet (editable)</summary><div class="csheet"></div></details><details class="notesbox"><summary class="nsum">Player notes</summary><div class="nbody"></div></details>';
+      el.innerHTML = '<div class="pchead"><h2></h2><span class="lock"></span><button class="btn small" data-act="levelup" type="button" title="Raise the level of this character">Level up</button><button class="btn small" data-act="login" type="button">Player login</button></div><details class="notesbox" open><summary>Overview (read-only)</summary><div class="povr"></div></details><div class="book"></div><details class="notesbox"><summary>Character sheet (editable)</summary><div class="csheet"></div></details><details class="notesbox"><summary class="nsum">Player notes</summary><div class="nbody"></div></details>';
       box.appendChild(el);
       mountBook(el.querySelector(".book"), store, { canEdit: true, library });
       // hit points live on the token, so the sheet's HP box reads and writes the token directly
@@ -1250,11 +1407,131 @@ async function pullSheets() {
 const randomPin = () => String(100000 + (crypto.getRandomValues(new Uint32Array(1))[0] % 900000));
 
 $("#party").addEventListener("click", (e) => {
+  const lv = e.target.closest('[data-act="levelup"]');
+  if (lv) { levelUpDialog([lv.closest(".pcard").dataset.pid]); return; }
   const b = e.target.closest('[data-act="login"]');
   if (!b) return;
   const pc = ent(b.closest(".pcard").dataset.pid);
   if (pc) loginDialog(pc);
 });
+$("#levelParty").onclick = () => levelUpDialog(state.ents.filter((e) => e.type === "pc").map((e) => e.id));
+
+/* ---------- leveling players ---------- */
+/* Raise the level of one character or several. The level, hit dice and spell slots live on the sheet; maximum hit points live on the
+   token. Everything is suggested from the class and can be changed here before it is applied. */
+async function levelUpDialog(pids) {
+  const rows = [];
+  for (const pid of pids) {
+    const e = ent(pid), o = sheets.get(pid);
+    if (!e || e.type !== "pc" || !o) continue;
+    if (!o.store.loaded) await o.store.load().catch(() => {});
+    const c = charOf(JSON.parse(JSON.stringify(o.store.view)));
+    rows.push({ pid, e, store: o.store, level: clamp(Number(c.info.level) || 1, 1, LEVEL_MAX), cls: String(c.info.class || "").trim(), info: classInfo(c.info.class), con: mod(c.abilities.con), hd: c.combat.hitDice });
+  }
+  if (!rows.length) { toast("There are no player characters to level up."); return; }
+  const sgn = (n) => (n >= 0 ? "+" : "−") + Math.abs(n);
+  const one = rows.length === 1;
+  const byPid = new Map(rows.map((r) => [r.pid, r]));
+  const rowHTML = (r) => `
+    <fieldset class="lvrow" data-pid="${r.pid}">
+      <legend>${one ? "" : '<label class="check"><input type="checkbox" data-use checked> '}<b>${esc(r.e.name)}</b>${one ? "" : "</label>"}
+        <small>${esc(r.cls ? `Level ${r.level} ${r.cls}` : `Level ${r.level}`)}</small></legend>
+      <div class="plgrid">
+        <label class="cf"><span>New level</span><input type="number" inputmode="numeric" data-lv min="1" max="${LEVEL_MAX}" value="${Math.min(LEVEL_MAX, r.level + 1)}"></label>
+        <label class="cf"><span>Max HP gained</span><input type="number" inputmode="numeric" data-hp value="0"></label>
+      </div>
+      <p class="hint" data-hphint></p>
+      <label class="check"><input type="checkbox" data-heal checked> Heal them by the same amount</label>
+      <label class="check" data-slotsrow hidden><input type="checkbox" data-slots checked> <span data-slotstext></span></label>
+      <label class="check" data-hdrow hidden><input type="checkbox" data-hd checked> <span data-hdtext></span></label>
+      <p class="hint" data-prof></p>
+    </fieldset>`;
+
+  function refreshRow(fs, force) {
+    const r = byPid.get(fs.dataset.pid);
+    const lv = clamp(parseInt(fs.querySelector("[data-lv]").value) || r.level, 1, LEVEL_MAX);
+    const gained = Math.max(0, lv - r.level), per = hpPerLevel(r.info, r.con);
+    const hpBox = fs.querySelector("[data-hp]");
+    if (force || !fs.dataset.touched) hpBox.value = per && gained ? per * gained : 0;
+    fs.querySelector("[data-hphint]").innerHTML = r.info
+      ? `${esc(r.info.name)} (d${r.info.die}): ${Math.floor(r.info.die / 2) + 1} on average ${sgn(r.con)} for Constitution is ${per} a level${gained > 1 ? `, for ${gained} levels` : ""}.
+         ${r.info.multi ? "This looks like more than one class, so check it yourself. " : ""}<button type="button" class="btn small ghost" data-rollhp ${gained ? "" : "disabled"}>Roll the hit die instead</button>`
+      : "I don't recognise this class, so type the hit points they gained.";
+    const slots = gained || lv !== r.level ? slotsFor(r.info, lv) : null;
+    fs.querySelector("[data-slotsrow]").hidden = !slots;
+    if (slots) fs.querySelector("[data-slotstext]").textContent = `Spell slots become ${slotText(slots)}`;
+    const hd = lv !== r.level ? hitDiceFor(r.info, lv, r.hd) : null;
+    fs.querySelector("[data-hdrow]").hidden = !hd;
+    if (hd) fs.querySelector("[data-hdtext]").textContent = `Hit dice become ${hd}`;
+    fs.querySelector("[data-prof]").textContent = profBonus(lv) !== profBonus(r.level) ? `Proficiency bonus goes from ${sgn(profBonus(r.level))} to ${sgn(profBonus(lv))}.` : `Proficiency bonus stays ${sgn(profBonus(lv))}.`;
+  }
+
+  openDlg(`
+    <form class="lvform">
+      <h2>${one ? `Level up ${esc(rows[0].e.name)}` : "Level up the party"}</h2>
+      <p class="hint" style="margin:0 0 .6rem">Everything below is a suggestion: change a number, or untick a line, before you apply it. You can also type any level, to correct one.</p>
+      <div class="lvlist">${rows.map(rowHTML).join("")}</div>
+      <div class="dlg-actions"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn primary">Apply</button></div>
+    </form>`, () => {
+    const results = [];
+    for (const fs of dlg.querySelectorAll(".lvrow")) {
+      if (!one && !fs.querySelector("[data-use]").checked) continue;
+      const r = byPid.get(fs.dataset.pid);
+      const lv = clamp(parseInt(fs.querySelector("[data-lv]").value) || r.level, 1, LEVEL_MAX);
+      const gain = parseInt(fs.querySelector("[data-hp]").value) || 0;
+      const slots = !fs.querySelector("[data-slotsrow]").hidden && fs.querySelector("[data-slots]").checked ? slotsFor(r.info, lv) : null;
+      const hd = !fs.querySelector("[data-hdrow]").hidden && fs.querySelector("[data-hd]").checked ? hitDiceFor(r.info, lv, r.hd) : null;
+      if (lv === r.level && !gain && !slots && !hd) continue;
+      r.store.mutate((d) => {   // the sheet: level, hit dice and spell slots
+        const ch = charOf(d);
+        ch.info.level = lv;
+        if (hd) ch.combat.hitDice = hd;
+        if (slots) {
+          for (let l = 1; l <= 9; l++) {
+            if (slots[l]) d.slots[l] = { max: slots[l], used: Math.min(d.slots[l]?.used || 0, slots[l]) };
+            else delete d.slots[l];
+          }
+        }
+      });
+      let hpNote = "";
+      const t = ent(r.pid);
+      if (t && gain) {   // the token: maximum hit points, and how many they have now
+        if (t.maxHp == null) hpNote = " (no max HP is set on their token, so the hit points weren't changed)";
+        else {
+          t.maxHp = Math.max(1, t.maxHp + gain);
+          if (fs.querySelector("[data-heal]").checked && t.hp != null) t.hp = clamp(t.hp + gain, 0, t.maxHp);
+          else if (t.hp != null) t.hp = Math.min(t.hp, t.maxHp);
+          hpNote = ` and ${gain > 0 ? "+" : ""}${gain} max HP`;
+        }
+      }
+      results.push(`${r.e.name} is level ${lv}${hpNote}`);
+    }
+    dlg.close();
+    if (!results.length) { toast("Nothing changed."); return; }
+    changed();
+    toast(results.length === 1 ? `${results[0]}.` : `Leveled up ${results.length} characters.`);
+  }, (root) => {
+    root.querySelectorAll(".lvrow").forEach((fs) => refreshRow(fs, true));
+    root.addEventListener("input", (e) => {
+      const fs = e.target.closest(".lvrow");
+      if (!fs) return;
+      if (e.target.matches("[data-lv]")) refreshRow(fs, false);
+      else if (e.target.matches("[data-hp]")) fs.dataset.touched = "1";   // they typed it, so level changes leave it alone
+    });
+    root.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-rollhp]");
+      if (!b) return;
+      const fs = b.closest(".lvrow"), r = byPid.get(fs.dataset.pid);
+      const lv = clamp(parseInt(fs.querySelector("[data-lv]").value) || r.level, 1, LEVEL_MAX), n = Math.max(0, lv - r.level);
+      let total = 0;
+      const bits = [];
+      for (let i = 0; i < n; i++) { const die = rand(r.info.die), got = Math.max(1, die + r.con); total += got; bits.push(`${die}${sgn(r.con)}`); }
+      fs.querySelector("[data-hp]").value = total;
+      fs.dataset.touched = "1";
+      fs.querySelector("[data-hphint]").innerHTML = `Rolled d${r.info.die}${n > 1 ? " " + n + " times" : ""}: ${esc(bits.join(", "))} = ${total} hit points. <button type="button" class="btn small ghost" data-rollhp>Roll again</button>`;
+    });
+  });
+}
 
 function loginDialog(pc) {
   openDlg(`
@@ -1371,6 +1648,15 @@ $("#libBtn").onclick = () => {
 /* ---------- objectives ---------- */
 const STATUS_LABEL = { active: "Active", done: "Completed", failed: "Failed" };
 
+/* The saved map an objective is tied to, with a way to go there. */
+function objPlace(o) {
+  if (!o.loc) return "";
+  const l = (locs?.list() || []).find((x) => x.id === o.loc);
+  return l
+    ? `<p class="oloc"><span class="lkk">Place</span> <b>${esc(l.name)}</b> <button class="btn small" type="button" data-act="goloc">Go there</button></p>`
+    : '<p class="oloc"><span class="lkk">Place</span> <small>(that map is no longer saved)</small></p>';
+}
+
 function renderObjectives() {
   const list = state.objectives;
   $("#objList").innerHTML = list.length ? list.map((o, i) => `
@@ -1380,6 +1666,7 @@ function renderObjectives() {
         <span class="pill">${o.hidden ? "Hidden · " : ""}${STATUS_LABEL[o.status]}</span>
       </header>
       ${o.note ? `<p class="onote">${esc(o.note)}</p>` : ""}
+      ${objPlace(o)}
       ${o.steps.length ? `<ul class="steps">${o.steps.map((st) => `
         <li><label class="check"><input type="checkbox" data-act="step" data-s="${st.id}" ${st.done ? "checked" : ""}> <span class="${st.done ? "done" : ""}">${esc(st.text)}</span></label></li>`).join("")}</ul>` : ""}
       <div class="oact">
@@ -1396,13 +1683,19 @@ function renderObjectives() {
 
 function objDialog(obj) {
   const isNew = !obj;
-  const o = obj || { id: uid(), title: "", note: "", status: "active", hidden: true, steps: [] };
+  const o = obj || { id: uid(), title: "", note: "", status: "active", hidden: true, steps: [], loc: "" };
+  const places = locs?.list() || [];
   openDlg(`
     <form>
       <h2>${isNew ? "Add objective" : "Edit objective"}</h2>
       <div class="field"><label for="o_title">Title</label><input id="o_title" name="title" type="text" maxlength="80" value="${esc(o.title)}" required autofocus></div>
       <div class="field"><label for="o_note">Description</label><textarea id="o_note" name="note" rows="3" maxlength="600">${esc(o.note)}</textarea></div>
       <div class="field"><label for="o_steps">Steps (one per line)</label><textarea id="o_steps" name="steps" rows="4" maxlength="800">${esc(o.steps.map((s) => s.text).join("\n"))}</textarea></div>
+      <div class="field"><label for="o_loc">Place</label><select id="o_loc" name="loc">
+        <option value="">Not tied to a place</option>
+        ${places.map((l) => `<option value="${l.id}" ${o.loc === l.id ? "selected" : ""}>${esc(l.name)}</option>`).join("")}
+        ${o.loc && !places.some((l) => l.id === o.loc) ? `<option value="${o.loc}" selected>(map no longer saved)</option>` : ""}</select>
+        <span class="hint">A saved map this objective belongs to. Players don't see it.</span></div>
       <div class="field"><label for="o_status">Status</label><select id="o_status" name="status">
         ${Object.entries(STATUS_LABEL).map(([k, v]) => `<option value="${k}" ${o.status === k ? "selected" : ""}>${v}</option>`).join("")}</select></div>
       <label class="check field"><input type="checkbox" name="show" ${o.hidden ? "" : "checked"}> Show to players</label>
@@ -1418,7 +1711,7 @@ function objDialog(obj) {
       const old = new Map(o.steps.map((s) => [s.text, s]));
       const steps = String(d.steps || "").split("\n").map((t) => t.trim()).filter(Boolean).slice(0, 20)
         .map((t) => old.get(t) || { id: uid(), text: t, done: false });
-      Object.assign(o, { title, note: d.note.trim(), steps, status: d.status, hidden: d.show !== "on" });
+      Object.assign(o, { title, note: d.note.trim(), steps, status: d.status, hidden: d.show !== "on", loc: d.loc || "" });
       if (isNew) state.objectives.push(o);
       dlg.close();
       changed();
@@ -1441,6 +1734,7 @@ $("#objList").addEventListener("click", (e) => {
   if (i < 0) return;
   const o = list[i];
   if (b.dataset.act === "edit") objDialog(o);
+  else if (b.dataset.act === "goloc") { if (o.loc) locs?.openSwitch(o.loc); }
   else if (b.dataset.act === "vis") { o.hidden = !o.hidden; changed(); }
   else if (b.dataset.act === "up" && i > 0) { [list[i - 1], list[i]] = [list[i], list[i - 1]]; changed(); }
   else if (b.dataset.act === "down" && i < list.length - 1) { [list[i + 1], list[i]] = [list[i], list[i + 1]]; changed(); }
@@ -1769,22 +2063,8 @@ $("#leave").onclick = () => {
   try {
     const r = await call(`login/${room}`, { method: "POST", body: { pin } });
     state = r.state;
-    state.ents ||= []; state.inv ||= {}; state.init ||= { list: [], turnId: null, round: 1, on: false };
-    state.grid ||= { on: false, size: 60, snap: false };
-    state.fog ||= { on: false, rev: 0 };
-    state.grid.opacity ??= 0.3;
-    state.grid.ox ||= 0; state.grid.oy ||= 0;
-    state.grid.areas ||= [];
-    state.feedOn ??= false;
-    state.campRev ??= 0;
-    state.freeExplore ??= false;
-    state.autoJoin ??= false;
-    state.autoApprove ??= false;
-    state.moveResults ||= {};
-    state.locId ??= "";
-    state.locName ??= "";
-    state.objectives ||= [];
-    state.inv.stash ||= []; state.inv.dm ||= [];
+    normalizeState();
+    synced = clone(state);   // what the server holds right now (with the same defaults filled in as our own copy)
     renderMap();
     renderSide();
     window.__started = true;   // the page's scripts all loaded and the table is on screen
@@ -1795,6 +2075,8 @@ $("#leave").onclick = () => {
       quick: $("#locQuick"),
       flushFog,
       setLocalMap: (rev, url) => { localMap = { rev, url }; },
+      links: (id) => locLinks.get(id) || [],
+      jump: jumpToLink,
     });
     await locs.load();
     renderMap();
@@ -1813,6 +2095,9 @@ $("#leave").onclick = () => {
     renderMoves();
     renderJoins();
     setInterval(pullSheets, 4000);
+    setInterval(pollState, 2000);
+    setInterval(pollVersions, 5000);
+    if (VIEW === "combat") enterCombatView();
   } catch (err) {
     if (err.status === 401 || err.status === 404) {
       localStorage.removeItem("dmTable");
