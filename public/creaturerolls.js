@@ -141,6 +141,13 @@ export function bindCardRolls(container, hooks = {}) {
     const mode = e.target.closest("[data-rmode]");
     if (mode) { const key = mode.closest("[data-ck]")?.dataset.ck; if (key) { stateOf(key).how = mode.dataset.rmode; paint(); } return; }
     if (e.target.closest("[data-rshare]")) { hooks.setShare?.(!hooks.getShare?.()); refreshRollBars(); return; }
+    const use = e.target.closest("[data-use]");
+    if (use) {   // "Use…": choose targets and let the server roll it all
+      e.preventDefault();
+      const card = use.closest("[data-tid]");
+      if (card?.dataset.tid && hooks.use) hooks.use({ kind: use.dataset.use, ref: use.dataset.ref, tid: card.dataset.tid, who: card.dataset.who });
+      return;
+    }
     const b = e.target.closest("[data-roll]");
     if (!b) return;
     e.preventDefault();   // (a roll button inside a spell's title shouldn't also open the spell)

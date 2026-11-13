@@ -23,7 +23,7 @@ export const blankCreature = (type = "enemy") => ({
 
 /* A stat block laid out for reading at the table.
    opts: { title, lib: (name) -> spell details, open: Map of open sections, key: id for the open-state keys, openByDefault: [names] } */
-export function cardHTML(c0, { title = true, lib = null, open = null, key = "", openByDefault = [], who = "" } = {}) {
+export function cardHTML(c0, { title = true, lib = null, open = null, key = "", openByDefault = [], who = "", tid = "" } = {}) {
   const c = normalizeStats({ ...c0 });
   const rk = key || `card:${c.id}`;   // also names this card's roll bar
   const saves = parseSaves(c.saves);
@@ -33,11 +33,11 @@ export function cardHTML(c0, { title = true, lib = null, open = null, key = "", 
   const sub = [c.kind, npc ? c.role : ""].filter((x) => String(x).trim()).join(" · ");
   const story = npc && [c.wants, c.secret, c.voice].some((x) => String(x).trim())
     ? `<hr>${block("Wants", c.wants)}${block("Secret", c.secret)}${block("Voice and manner", c.voice)}` : "";
-  const S = structuredSections(c, { lib, open, key: rk });
+  const S = structuredSections(c, { lib, open, key: rk, tid });
   const free = (t) => (String(t ?? "").trim() ? `<div class="sc-text">${rollifyText(t)}</div>` : "");
   const dexMod = mod(c.abilities.dex);
   const sect = (label, structured, text) => (structured.trim() || String(text ?? "").trim() ? `<h3 class="sc-h">${label}</h3>${structured}${free(text)}` : "");
-  return `<article class="statcard ${npc ? "npc" : "enemy"}" data-ck="${esc(rk)}" data-who="${esc(who || c.name || "")}">
+  return `<article class="statcard ${npc ? "npc" : "enemy"}" data-ck="${esc(rk)}" data-who="${esc(who || c.name || "")}" data-tid="${esc(tid)}">
     ${title ? `<h2>${esc(c.name || "Unnamed")}</h2>` : ""}
     ${sub ? `<p class="sc-sub">${esc(sub)}</p>` : ""}
     ${barHTML(rk)}
@@ -535,9 +535,9 @@ export function mountCreatures(root, { room, pin, toast, addToMap, showTab, spel
   });
 
   /* ----- the stat block card, and putting creatures on the map ----- */
-  function openCard(c, who = "") {
+  function openCard(c, who = "", tid = "") {
     bindCardRolls(dlg, rolls);
-    dlg.innerHTML = `<div class="cardwrap">${cardHTML(c, { lib: spellFind, open: cardOpen, key: who ? `card:${c.id}:${who}` : "card:" + c.id, who, openByDefault: ["spells"] })}
+    dlg.innerHTML = `<div class="cardwrap">${cardHTML(c, { lib: spellFind, open: cardOpen, key: who ? `card:${c.id}:${who}` : "card:" + c.id, who, tid, openByDefault: ["spells"] })}
       <div class="dlg-actions"><button type="button" class="btn" data-close>Close</button>
       <button type="button" class="btn" data-edit>Edit</button>
       <button type="button" class="btn primary" data-map>Add to map…</button></div></div>`;
@@ -597,11 +597,11 @@ export function mountCreatures(root, { room, pin, toast, addToMap, showTab, spel
     refresh,
     rev: () => doc?.rev ?? null,
     /* Open a creature's stat block card. Resolves to false if it's no longer in the library. */
-    async card(id, who = "") {
+    async card(id, who = "", tid = "") {
       await ensureLoaded();
       const c = doc?.creatures.find((x) => x.id === id);
       if (!c) return false;
-      openCard(c, who);
+      openCard(c, who, tid);
       return true;
     },
     async edit(id) { await ensureLoaded(); if (doc?.creatures.some((x) => x.id === id)) { showTab?.(); select(id); return true; } return false; },

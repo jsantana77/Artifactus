@@ -9,6 +9,7 @@ import { mountCampaign } from "./campaign-ui.js";
 import { mountCreatures } from "./creatures.js";
 import { mountCombatPanel, pcCardHTML, pcStats, partyGlanceHTML, bindOpenState } from "./combat.js";
 import { refreshRollBars } from "./creaturerolls.js";
+import { openActionDialog, resultHTML, ord as ordinal } from "./actions.js";
 import { merge3, applyInPlace, clone, deepEq } from "./merge.js";
 import { mountLocations } from "./locations.js";
 
@@ -37,6 +38,7 @@ let shareDm = localStorage.getItem("shareDm:" + room) === "1";
 /* Tap-to-roll on NPC and enemy cards: a roll appears under the creature's own name in the roll feed when the DM shares their rolls. */
 const rollHooks = {
   post(r) { if (shareDm) call(`roll/${room}`, { method: "POST", body: { dm: true, ...r }, pin }).catch(() => {}); },
+  use: (info) => dmUseAction(info),
   getShare: () => shareDm,
   setShare(on) {
     shareDm = !!on;
@@ -151,6 +153,7 @@ function absorb(raw) {
 function renderRemote() {
   renderMap();
   renderSide();
+  announceNoticed();
   if (tab === "inv") renderInv();
   if (tab === "party") { renderParty(); renderGlance(); }
   if (tab === "obj") renderObjectives();
@@ -289,6 +292,7 @@ function renderMap() {
   if (persp) { $("#gridCols").value = state.grid.cols ?? 10; $("#gridRows").value = state.grid.rows ?? 18; }
   $("#snapOn").checked = !!state.grid.snap;
   $("#mapOn").checked = !!state.mapOn;
+  $("#autoApply").checked = !!state.autoApply;
   $("#freeExplore").checked = !!state.freeExplore;
   $("#autoApprove").checked = !!state.autoApprove;
   $("#autoJoin").checked = !!state.autoJoin;
@@ -715,8 +719,8 @@ function ensureCreatures() {
   creatures.load();
   return creatures;
 }
-async function showStats(cid, who = "") {
-  const ok = await ensureCreatures().card(cid, who);
+async function showStats(cid, who = "", tid = "") {
+  const ok = await ensureCreatures().card(cid, who, tid);
   if (!ok) toast("That creature isn't in the NPCs & Enemies library any more.");
 }
 function ensureCampaign() {
@@ -855,11 +859,21 @@ function editToken(id) {
         <div class="field"><label for="f_hp">HP</label><input id="f_hp" name="hp" type="number" value="${e.hp ?? ""}"></div>
         <div class="field"><label for="f_mhp">Max HP</label><input id="f_mhp" name="maxHp" type="number" value="${e.maxHp ?? ""}"></div>
       </div>
+      <div class="field"><label for="f_ac">Armor class (optional)</label><input id="f_ac" name="ac" type="number" min="0" max="40" value="${e.ac ?? ""}" placeholder="From its stat block or sheet"><small class="hint">Used when someone attacks it. Leave blank to use the stat block or the character sheet.</small></div>
       <div class="field" data-grp="people"><label for="f_speed">Speed (feet)</label><input id="f_speed" name="speed" type="number" min="0" max="300" step="5" value="${e.speed ?? ""}" placeholder="From their sheet, or 30"></div>
       ${e.moved ? `<label class="check field" data-grp="people"><input type="checkbox" name="resetMove"> Give back the ${e.moved} feet moved this turn</label>` : ""}
       <div class="field"><label for="f_img">Token image</label><input id="f_img" name="image" type="file" accept="image/*"></div>
       ${e.img ? '<label class="check field"><input type="checkbox" name="rmimg"> Remove current image</label>' : ""}
       <label class="check field"><input type="checkbox" name="hidden" ${e.hidden ? "checked" : ""}> Hidden from players</label>
+      <div class="field hunt" data-grp="hunt" ${e.hidden ? "" : "hidden"}>
+        <label for="f_pdc">Perception DC to notice it (optional)</label>
+        <div class="row" style="align-items:flex-end">
+          <input id="f_pdc" name="pdc" type="number" min="1" max="40" value="${e.pdc ?? ""}" placeholder="No check">
+          <div class="field" style="margin:0"><label for="f_prange">Within (squares)</label><input id="f_prange" name="prange" type="number" min="0" max="100" value="${e.prange ?? ""}" placeholder="6"></div>
+        </div>
+        <label class="check"><input type="checkbox" name="pauto" ${e.pauto ? "checked" : ""}> Reveal it automatically when found</label>
+        <small class="hint">When a player's Perception roll meets the DC and they are within range, you're told (or it appears, if automatic). 0 squares means from anywhere on the map.</small>
+      </div>
       <label class="check field"><input type="checkbox" name="down" ${e.down ? "checked" : ""}> Down / dead / destroyed</label>
       <div class="dlg-actions">
         <button type="button" class="btn danger push" data-delete>Delete token</button>
@@ -888,6 +902,9 @@ function editToken(id) {
       if (d.resetMove === "on") { e.moved = 0; e.dashed = false; }
       e.hidden = d.hidden === "on";
       e.down = d.down === "on";
+      if (d.ac === "" || d.ac === undefined) delete e.ac; else e.ac = clamp(Number(d.ac) || 0, 0, 40);
+      if (d.pdc === "" || d.pdc === undefined) { delete e.pdc; delete e.prange; delete e.pauto; delete e.noticed; }
+      else { e.pdc = clamp(Number(d.pdc) || 1, 1, 40); e.prange = d.prange === "" || d.prange === undefined ? 6 : clamp(Number(d.prange) || 0, 0, 100); e.pauto = d.pauto === "on"; }
       if (e.type === "pc" && !state.inv[e.id]) state.inv[e.id] = [];
       if (wasPc && e.type !== "pc") returnItemsToStash(e.id);
       const file = d.image instanceof File && d.image.size > 0 ? d.image : null;
@@ -903,6 +920,7 @@ function editToken(id) {
       const sync = () => {
         const obj = root.querySelector("#f_type").value === "object";
         root.querySelector('[data-grp="object"]').hidden = !obj;
+        root.querySelector('[name="hidden"]').addEventListener("change", (ev) => { root.querySelector('[data-grp="hunt"]').hidden = !ev.target.checked; });
         root.querySelector('[data-grp="people"]').hidden = obj;
       };
       root.querySelector("#f_type").addEventListener("change", sync);
@@ -1125,6 +1143,8 @@ function renderTokens() {
       ${e.type === "object" && (e.icon ?? "📦") ? `<span class="oicon" aria-hidden="true">${esc(e.icon ?? "📦")}</span>`
         : `<span class="dot" style="--c:${(e.type === "object" && e.tint) || TYPES[e.type].color}"></span>`}
       <button class="tname" data-act="focus">${esc(e.name)}</button>
+      ${e.hidden && e.pdc != null && e.pdc !== "" ? `<small class="dcnote" title="Perception DC to notice it">DC ${esc(e.pdc)}</small>` : ""}
+      ${e.hidden && e.noticed ? `<small class="noticed-tag" title="Spotted with a Perception check">Noticed by ${esc(e.noticed.by)} (${esc(e.noticed.roll)})</small><button class="btn small primary" data-act="reveal">Reveal</button>` : ""}
       <button class="btn small ghost" data-act="vis" aria-pressed="${!!e.hidden}">${e.hidden ? "Hidden" : "Visible"}</button>
       ${e.type === "object" ? `<button class="btn small ghost" data-act="rot" aria-label="Turn ${esc(e.name)} 90 degrees" title="Turn 90°">↻</button>` : ""}
       <button class="btn small ghost" data-act="init" aria-pressed="${inInit}">Init</button>
@@ -1149,7 +1169,8 @@ $("#tokList").addEventListener("click", (ev) => {
       if (state.init.list.some((i) => i.id === id)) removeFromInit(id, true);
       else { addToInit(id); changed(); }
       break;
-    case "stats": showStats(e.cid, e.name); break;
+    case "stats": showStats(e.cid, e.name, e.id); break;
+    case "reveal": e.hidden = false; delete e.noticed; changed(); break;
     case "sheet": showPcCard(id); break;
     case "edit": editToken(id); break;
   }
@@ -1820,10 +1841,13 @@ function refreshOverlays() {
 }
 setInterval(refreshOverlays, 1000);
 
+let fxSeq = 0;
 async function pollPings() {
   if (!state || document.hidden) return;
   try {
-    const r = await call(`pings/${room}`);
+    const r = await call(`pings/${room}?fx=${fxSeq}`, { pin });
+    for (const f of r.fx || []) if (r.now - f.t < 7000) mv.pop(f.token, f.text, f.kind);   // numbers floating over tokens
+    fxSeq = r.fxSeq ?? fxSeq;
     const now = Date.now();
     dmPings = r.pings.map((p) => ({ id: p.id, x: p.x, y: p.y, label: p.who, color: pingColor(p.pid || p.who), expires: now + (PING_TTL - (r.now - p.t)) }));
     refreshOverlays();
@@ -2016,6 +2040,91 @@ function renderFeed(feed) {
 }
 
 $("#feedOn").onchange = (e) => { state.feedOn = e.target.checked; changed(); };
+/* ---------- using a creature's attacks and spells ---------- */
+/* From a stat block's "Use…": choose targets, and the server rolls it: attacks against armor class, the targets' own saves, damage. */
+async function dmUseAction({ kind, ref, tid }) {
+  const actor = ent(tid);
+  if (!actor) return;
+  const lib = await ensureCreatures().list();
+  const cr = lib.find((c) => c.id === actor.cid);
+  if (!cr) { toast("That token isn't linked to a stat block."); return; }
+  let attack = null, spell = null, label = "", extra = {};
+  if (kind === "attack") {
+    const a = (cr.attacks || []).find((x) => x.id === ref);
+    if (!a) return;
+    label = a.name || "Attack";
+    attack = { bonus: a.kind === "save" || a.kind === "other" ? null : a.bonus, damageText: (a.damage || []).map((d) => `${d.dice} ${d.type}`.trim()).join(" + ") + (a.save?.ability ? ` · DC ${a.save.dc} save` : "") };
+  } else {
+    const sc = cr.spellcasting;
+    const sp = (sc?.spells || []).find((x) => x.id === ref || x.name === ref);
+    if (!sp) return;
+    await library.load().catch(() => {});
+    label = sp.name;
+    spell = { name: sp.name, level: sp.level, entry: library.find(sp.name) || null };
+    extra = { casterLevel: sc.level || 1, dc: sc.dc, atk: sc.atk, spellMod: sc.ability ? mod(cr.abilities[sc.ability]) : 0 };
+  }
+  openActionDialog({
+    doc: combatDoc || document,
+    actor: { id: tid, name: actor.name }, kind, ref, label, spell, attack, noSlots: true, slots: {}, ...extra,
+    tokens: state.ents.map((e) => ({ id: e.id, name: e.name + (e.hidden ? " (hidden)" : ""), type: e.type, hp: e.hp, maxHp: e.maxHp, x: e.x, y: e.y })),
+    grid: { on: state.grid.on, size: state.grid.size, mapW: state.mapW, mapH: state.mapH }, dm: true,
+    share: { get: () => shareDm, set: rollHooks.setShare },
+    send: (body) => call(`act/${room}`, { method: "POST", body: { actor: tid, ...body }, pin }),
+    apply: async (id) => { await call(`actapply/${room}`, { method: "POST", body: { id }, pin }); pullActs(); pollState(); },
+    onResult: () => { pullActs(); pollState(); },
+  });
+}
+
+/* The record of what was used, with Apply buttons for the damage and healing. */
+let actsList = [], actsKey = "";
+async function pullActs() {
+  if (!state || document.hidden) return;
+  try {
+    const r = await call(`acts/${room}`, { pin });
+    const key = JSON.stringify(r.acts.map((a) => [a.id, Object.keys(a.applied || {}).length]));
+    if (key === actsKey) return;
+    actsKey = key;
+    actsList = r.acts;
+    renderActs();
+  } catch { /* try again next time */ }
+}
+const agoText = (t) => { const s = Math.round((Date.now() - t) / 1000); return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`; };
+function renderActs() {
+  const list = actsList.slice(0, 12);
+  $("#actCount").textContent = list.length ? `last ${list.length}` : "";
+  $("#actList").innerHTML = list.map((a) => {
+    const r = a.res;
+    const todo = r.targets.filter((t) => (t.dealt > 0 || t.healed > 0) && !a.applied?.[t.id]);
+    return `<li class="actrow" data-id="${a.id}">
+      <div class="acthead"><b>${esc(r.actor.name)}</b> · ${esc(r.name)}${r.slot ? ` <small>(${ordinal(r.slot)} level)</small>` : ""} <small>${agoText(a.t)}</small></div>
+      ${resultHTML(r, { dm: true })}
+      ${todo.length ? `<div class="actapply">${todo.map((t) => `<button class="btn small" data-apply="${esc(t.id)}">${t.dealt ? `−${t.dealt}` : `+${t.healed}`} ${esc(t.name)}</button>`).join("")}${todo.length > 1 ? '<button class="btn small primary" data-apply="*">Apply all</button>' : ""}</div>` : r.targets.some((t) => t.dealt || t.healed) ? '<small class="hint">Applied</small>' : ""}
+    </li>`;
+  }).join("") || '<li class="empty">Nothing used yet. Use an attack or spell from a stat block, or watch for your players\' Cast and Attack buttons.</li>';
+}
+$("#actList").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-apply]");
+  if (!b) return;
+  const id = b.closest(".actrow").dataset.id;
+  b.disabled = true;
+  try { await call(`actapply/${room}`, { method: "POST", body: { id, target: b.dataset.apply === "*" ? undefined : b.dataset.apply }, pin }); } catch { toast("Couldn't apply that."); }
+  await pullActs();
+  pollState();
+});
+$("#autoApply").onchange = (e) => { state.autoApply = e.target.checked; changed(); };
+
+/* A Perception roll noticed something hidden: tell the DM once. */
+const seenNoticed = new Map();
+function announceNoticed(silent = false) {
+  const now = new Map();
+  for (const e of state.ents) if (e.hidden && e.noticed) now.set(e.id, `${e.noticed.by}:${e.noticed.roll}`);
+  for (const [id, k] of now) {
+    if (seenNoticed.get(id) !== k && !silent) { const e = ent(id); toast(`${e.noticed.by} noticed ${e.name} (Perception ${e.noticed.roll}).`); }
+  }
+  seenNoticed.clear();
+  for (const [id, k] of now) seenNoticed.set(id, k);
+}
+
 $("#shareDm").onchange = (e) => {
   shareDm = e.target.checked;
   refreshRollBars();
@@ -2097,6 +2206,9 @@ $("#leave").onclick = () => {
     setInterval(pullSheets, 4000);
     setInterval(pollState, 2000);
     setInterval(pollVersions, 5000);
+    announceNoticed(true);
+    pullActs();
+    setInterval(pullActs, 3000);
     if (VIEW === "combat") enterCombatView();
   } catch (err) {
     if (err.status === 401 || err.status === 404) {

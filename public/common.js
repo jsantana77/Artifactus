@@ -352,6 +352,27 @@ export class MapView {
     }
   }
 
+  /* A number floats up over a token and fades: a roll, a saving throw, a healing. kind: hit, save, heal (green), miss, fail (red),
+     neutral (white), found (gold). Several at once spread sideways so they don't sit on top of each other. */
+  pop(id, text, kind = "neutral") {
+    const e = this.ents.find((x) => x.id === id);
+    const { w, h } = this.dim;
+    if (!e || !w) return;
+    const doc = this.world.ownerDocument;
+    const tokEl = this.els.get(id);
+    const up = tokEl ? tokEl.offsetHeight / 2 : 20;
+    const n = [...this.tokLayer.querySelectorAll(".fxnum")].filter((x) => x.dataset.t === id).length;
+    const el = doc.createElement("div");
+    el.className = `fxnum fx-${/^(hit|miss|save|fail|heal|neutral|found)$/.test(kind) ? kind : "neutral"}`;
+    el.dataset.t = id;
+    el.textContent = text;
+    el.style.left = e.x * w + "px";
+    el.style.top = e.y * h - up + "px";
+    el.style.setProperty("--dx", `calc(${(n % 2 ? 1 : -1) * Math.ceil(n / 2) * 34}px * var(--inv,1))`);
+    this.tokLayer.appendChild(el);
+    setTimeout(() => el.remove(), 3800);
+  }
+
   update({ ents, grid, turnId, selId }) {
     if (ents) this.ents = ents;
     if (grid) this.grid = grid;
@@ -399,6 +420,8 @@ export class MapView {
       el.classList.toggle("inside", obj && (e.labelIn ?? struct));
       el.classList.toggle("nolabel", !!e.noLabel);
       el.classList.toggle("hidden", !!e.hidden);
+      el.dataset.dc = e.hidden && Number.isFinite(Number(e.pdc)) && e.pdc !== null && e.pdc !== "" ? String(e.pdc) : "";   // (the DM's view only: players never get these)
+      el.classList.toggle("noticed", !!(e.hidden && e.noticed));
       el.classList.toggle("down", !!e.down);
       el.classList.toggle("turn", this.turnId === e.id);
       el.classList.toggle("sel", this.selId === e.id);

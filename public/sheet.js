@@ -104,7 +104,7 @@ const typingIn = (root) => { const a = root.ownerDocument.activeElement; return 
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
 
 /* ---------- spell slots + known spells ---------- */
-export function mountBook(root, store, { canEdit = true, library = null } = {}) {
+export function mountBook(root, store, { canEdit = true, library = null, onCast = null } = {}) {
   let editSlots = false, editing = null, adding = false, picking = false, msg = "", msgTimer = null;
   let pq = "", plv = "";
   const open = new Set();
@@ -186,7 +186,7 @@ export function mountBook(root, store, { canEdit = true, library = null } = {}) 
             <input type="checkbox" data-act="prep" ${p.prepared ? "checked" : ""} ${canEdit ? "" : "disabled"} aria-label="${esc(p.name)} prepared">
             <span class="sinfo"><button class="sname" data-act="edit" ${canEdit ? "" : "disabled"}>${esc(p.name)}</button>${p.note ? `<small>${esc(p.note)}</small>` : ""}</span>
             ${library?.find(p.name) ? `<button class="btn small ghost" data-act="info" aria-expanded="${open.has(p.id)}">Info</button>` : ""}
-            ${canEdit && lv > 0 ? '<button class="btn small" data-act="cast">Cast</button>' : ""}
+            ${canEdit && (onCast || lv > 0) ? '<button class="btn small" data-act="cast">Cast</button>' : ""}
           </div>
           ${details(p)}
         </li>`;
@@ -292,6 +292,7 @@ export function mountBook(root, store, { canEdit = true, library = null } = {}) 
     } else if (act === "cast" && li) {
       const sp = store.view.spells.find((p) => p.id === li.dataset.id);
       if (!sp) return;
+      if (onCast) { onCast(sp); return; }   // the page chooses targets, rolls it, and spends the slot
       const s = store.view.slots[sp.level];
       if (!s || s.used >= s.max) { flash(`No level ${sp.level} slots left for ${sp.name}. Tap a higher slot to spend it instead.`); return; }
       store.mutate((d) => { d.slots[sp.level].used += 1; });

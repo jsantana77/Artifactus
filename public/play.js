@@ -1,3 +1,5 @@
+import { openActionDialog } from "./actions.js";
+import { pcFromSheet, parseBonus } from "./actionrules.js";
 import { call, esc, TYPES, MapView, uid, pingColor, PING_TTL, getAccount } from "./common.js";
 import { openPopout } from "./popout.js";
 import { mountRoller, rand } from "./dice.js";
@@ -492,8 +494,8 @@ function bindStore() {
   store = new SheetStore(room, me, auth());
   store.subscribe(() => { if (store.status === "auth") logout("Your login changed, so please sign in again."); });
   for (const [sel, mount, opts] of [
-    ["#charBody", mountChar, { hp: hpOpts, onRoll: sheetRoll }],
-    ["#spellBody", mountBook, { canEdit: true, library }],
+    ["#charBody", mountChar, { hp: hpOpts, onRoll: sheetRoll, onUse: (a) => useAction("attack", a) }],
+    ["#spellBody", mountBook, { canEdit: true, library, onCast: (sp) => useAction("spell", sp) }],
     ["#noteBody", mountNotes, { canEdit: true }],
   ]) {
     const host = $(sel);
@@ -778,10 +780,37 @@ updateWho();
 let timer;
 const schedule = () => { clearTimeout(timer); timer = setTimeout(poll, 2000); };
 
+/* ---------- using an attack or a spell on a target ---------- */
+/* The dice are rolled by the server: attacks against the target's armor class, the target's own saving throw against your spell save DC,
+   damage, and the spell slot. Numbers float over the tokens as soon as it's done. */
+function useAction(kind, item) {
+  if (!me || !st) { mapMsg("Sign in as your character first."); return; }
+  const sheet = store?.view;
+  const pc = sheet ? pcFromSheet(sheet) : null;
+  const tokens = st.ents.filter((e) => e.type !== "object").map((e) => ({ id: e.id, name: e.name, type: e.type, hp: e.type === "pc" ? e.hp : null, maxHp: e.type === "pc" ? e.maxHp : null, x: e.x, y: e.y }));
+  openActionDialog({
+    doc: sheetPopDoc || document,
+    actor: { id: me, name: session?.name || "You" },
+    kind, ref: item.id, label: item.name || (kind === "attack" ? "Attack" : "Spell"),
+    spell: kind === "spell" ? { name: item.name, level: item.level, entry: library?.find(item.name) || null } : null,
+    attack: kind === "attack" ? { bonus: parseBonus(item.bonus), damageText: item.damage } : null,
+    slots: sheet?.slots || {}, casterLevel: pc?.level, dc: pc?.spellDC, atk: pc?.spellAtk, spellMod: pc?.spellMod,
+    tokens, grid: { on: st.grid?.on, size: st.grid?.size, mapW: st.mapW, mapH: st.mapH }, dm: false,
+    send: (body) => call(`act/${room}`, { method: "POST", body: { actor: me, ...body }, ...auth() }),
+    onResult: () => { store?.load?.(); poll(); },
+  });
+}
+
+/* Numbers floating over tokens: a roll, a saving throw, a healing. Anything older than a few seconds is skipped (we just opened the page). */
+let fxSeq = 0;
+function showFx(list, now) {
+  for (const f of list || []) if (now - f.t < 7000) mv.pop(f.token, f.text, f.kind);
+}
+
 async function poll() {
   if (pageHidden()) { schedule(); return; }
   try {
-    const r = await call(`state/${room}?rev=${rev}&ft=${ft}&pt=${pt}`);
+    const r = await call(`state/${room}?rev=${rev}&ft=${ft}&pt=${pt}&fx=${fxSeq}`);
     $("#conn").classList.remove("off");
     if (!r.unchanged) {
       const first = !st;
@@ -794,6 +823,8 @@ async function poll() {
         addPing({ id: p.id, x: p.x, y: p.y, label: p.pid && p.pid === me ? (session?.name || p.who) : p.who, color: pingColor(p.pid || p.who) }, PING_TTL - (r.now - p.t));
       }
       render();
+      showFx(r.fx, r.now);
+      fxSeq = r.fxSeq ?? fxSeq;
       if (first || !session) maybeAskLogin();
     }
   } catch (err) {

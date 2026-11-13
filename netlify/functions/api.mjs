@@ -57,6 +57,7 @@
 // A DM proves who they are with either the table PIN or "acct:<token>" in the x-pin header; the token only
 // works for tables the account owns. Player requests for a locked character carry the header x-player.
 import { getStore } from "@netlify/blobs";
+import { classifySpell, resolveAction, summarize, pcFromSheet, parseBonus, parseDamageText, parseAc, parseSaveList, modOf } from "../../public/actionrules.js";
 
 const reply = (data, status = 200) =>
   new Response(JSON.stringify(data), {
@@ -103,7 +104,8 @@ function publicView(s) {
     .filter((e) => !e.hidden)
     .map((e) => {
       visible.add(e.id);
-      return e.type === "pc" ? e : { ...e, hp: null, maxHp: null, initMod: undefined, cid: undefined };   // players don't see enemy HP, initiative bonuses, or which library entry a token came from
+      const { pdc, prange, pauto, noticed, ...rest } = e;   // the DM's Perception notes
+      return e.type === "pc" ? rest : { ...rest, hp: null, maxHp: null, initMod: undefined, cid: undefined, ac: undefined };   // players don't see enemy HP, initiative bonuses, or which library entry a token came from
     });
   const inv = { stash: s.inv?.stash || [] };
   for (const e of ents) if (e.type === "pc") inv[e.id] = s.inv?.[e.id] || [];
@@ -382,6 +384,106 @@ const livePings = async (store, room) => {
   const now = Date.now();
   return (b?.list || []).filter((p) => now - p.t < PING_TTL);
 };
+
+/* ---------- using attacks and spells on targets ---------- */
+/* A fair die: whole numbers from 1 to n, with no bias from the remainder. */
+const serverRng = (n) => {
+  const a = new Uint32Array(1), lim = Math.floor(4294967296 / n) * n;
+  let x;
+  do { crypto.getRandomValues(a); x = a[0]; } while (x >= lim);
+  return 1 + (x % n);
+};
+
+/* The built-in spell list (a static file on the site), read once. A table's own spells come first. */
+let builtinSpells = null;
+async function spellEntry(store, room, req, name) {
+  const want = String(name || "").trim().toLowerCase();
+  if (!want) return null;
+  const own = await store.get(`lib/${room}`, { type: "json" });
+  const mine = (own?.spells || []).find((s) => String(s.name).toLowerCase() === want);
+  if (mine) return mine;
+  if (!builtinSpells) {
+    try { builtinSpells = await (await fetch(new URL("/spells.json", req.url))).json(); } catch { builtinSpells = null; }
+  }
+  return (builtinSpells || []).find((s) => String(s.name).toLowerCase() === want) || null;
+}
+
+/* Short-lived events for the table: the number that floats over a token when something is rolled. Players and the DM both poll. */
+const FX_TTL = 25000, FX_KEEP = 30;
+const readFx = async (store, room) => (await store.get(`fx/${room}`, { type: "json" })) || { seq: 0, list: [] };
+async function pushFx(store, room, items) {
+  if (!items.length) return;
+  const cur = await readFx(store, room), now = Date.now();
+  let seq = cur.seq || 0;
+  const list = (cur.list || []).filter((x) => now - x.t < FX_TTL);
+  for (const it of items) list.push({ seq: ++seq, t: now, token: cleanId(it.token), text: str(it.text, 12), kind: ["hit", "miss", "save", "fail", "heal", "neutral", "found"].includes(it.kind) ? it.kind : "neutral", vis: it.vis === "dm" ? "dm" : "all" });
+  await store.setJSON(`fx/${room}`, { seq, list: list.slice(-FX_KEEP) });
+}
+const fxSince = (fx, since, dm) => (fx.list || []).filter((x) => x.seq > since && Date.now() - x.t < FX_TTL && (dm || x.vis === "all"));
+
+/* Change the live table from the server (the DM screens merge it in like any other change). */
+async function mutateState(store, room, fn) {
+  const s = await store.get(`state/${room}`, { type: "json" });
+  if (!s) return null;
+  const result = await fn(s);
+  if (result === false) return null;   // nothing to change
+  const out = result ?? s;
+  out.ver = (Number(s.ver) || 0) + 1;
+  out.rev = (Number(s.rev) || 0) + 1;
+  await store.setJSON(`state/${room}`, out, { metadata: { ver: out.ver } });
+  return out;
+}
+
+/* Hit points after damage or healing, the way the DM page does it. */
+function applyToEnt(e, dealt, healed) {
+  if (!e) return;
+  const base = e.hp ?? e.maxHp ?? 0;
+  if (dealt > 0) e.hp = Math.max(0, base - dealt);
+  else if (healed > 0) e.hp = e.maxHp != null ? Math.min(e.maxHp, base + healed) : base + healed;
+}
+
+/* A Perception roll: anything hidden within reach whose Perception DC the roll meets is noticed. The DM is told (the token is marked);
+   a token set to "reveal when found" appears for everyone. Returns the tokens found. */
+async function noticeHidden(store, room, me, total) {
+  const found = [];
+  await mutateState(store, room, (st) => {
+    const g = st.grid?.on && Number(st.grid.size) > 0 ? Number(st.grid.size) : 0;
+    const squares = (e) => (g ? Math.hypot((e.x - me.x) * (Number(st.mapW) || 1), (e.y - me.y) * (Number(st.mapH) || 1)) / g : 0);
+    let changed = false;
+    for (const e of st.ents || []) {
+      if (!e.hidden || e.pdc === undefined || e.pdc === null || e.pdc === "" || !Number.isFinite(Number(e.pdc))) continue;
+      const range = Number.isFinite(Number(e.prange)) && e.prange !== "" && e.prange !== null ? Number(e.prange) : 6;   // squares; 0 means anywhere
+      if (total < Number(e.pdc) || (range > 0 && g && squares(e) > range)) continue;
+      found.push(e.id);
+      if (e.pauto) { e.hidden = false; delete e.noticed; }
+      else if (!e.noticed || total > Number(e.noticed.roll)) e.noticed = { by: me.name, roll: total, t: Date.now() };
+      else continue;
+      changed = true;
+    }
+    return changed ? st : false;
+  });
+  if (found.length) {
+    const st = await store.get(`state/${room}`, { type: "json" });
+    await pushFx(store, room, found.map((id) => ({ token: id, text: "!", kind: "found", vis: (st?.ents || []).find((x) => x.id === id)?.hidden ? "dm" : "all" })));
+  }
+  return found;
+}
+
+/* Apply what a result did to the table: damage and healing on the tokens it hit. Skips targets already applied. */
+async function applyRecord(store, room, rec, only) {
+  const todo = (rec.res.targets || []).filter((t) => (t.dealt > 0 || t.healed > 0) && !rec.applied[t.id] && (!only || only.includes(t.id)));
+  if (!todo.length) return [];
+  await mutateState(store, room, (st) => { for (const t of todo) applyToEnt((st.ents || []).find((e) => e.id === t.id), t.dealt, t.healed); });
+  for (const t of todo) rec.applied[t.id] = true;
+  return todo.map((t) => t.id);
+}
+
+/* What players are allowed to read of a result: no armor classes of the things they hit. */
+function playerView(res) {
+  const r = JSON.parse(JSON.stringify(res));
+  for (const t of r.targets || []) delete t.ac;
+  return r;
+}
 
 /* Saved locations: each remembers its map, grid, fog and where the tokens stood. DM-only document. */
 const flt = (v, lo, hi, def) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : def; };
@@ -699,8 +801,10 @@ export default async (req) => {
       const pt = Number(url.searchParams.get("pt") || 0);
       const pings = state.mapOn ? await livePings(store, room) : [];
       const latestPing = pings.length ? pings[pings.length - 1].t : 0;
-      if (rev && Number(rev) === state.rev && (!keys || ft === latest) && pt === latestPing) return reply({ unchanged: true });
-      return reply({ state: publicView(state), feed: keys ? readFeed(keys, room, 30) : null, pings, now: Date.now() });
+      const fxAll = await readFx(store, room);
+      const fxNew = fxSince(fxAll, Number(url.searchParams.get("fx") || 0), false);
+      if (rev && Number(rev) === state.rev && (!keys || ft === latest) && pt === latestPing && !fxNew.length) return reply({ unchanged: true });
+      return reply({ state: publicView(state), feed: keys ? readFeed(keys, room, 30) : null, pings, fx: fxNew, fxSeq: fxAll.seq, now: Date.now() });
     }
 
     if (route === "state" && req.method === "PUT") {
@@ -815,7 +919,154 @@ export default async (req) => {
       await store.set(key, "1");
       const keys = await feedKeys(store, room);
       if (keys.length > FEED_MAX) await Promise.all(keys.slice(0, keys.length - FEED_MAX).map((k) => store.delete(k)));
-      return reply({ ok: true });
+      // A player's roll shows over their token for everyone; a Perception roll may notice something hidden nearby.
+      let found = [];
+      if (!b.dm && b.pid) {
+        const st = await store.get(`state/${room}`, { type: "json" });
+        const me = st?.ents?.find((x) => x.id === b.pid && x.type === "pc");
+        if (me && who === me.name) {
+          await pushFx(store, room, [{ token: me.id, text: String(total), kind: "neutral", vis: "all" }]);
+          if (String(b.key || "") === "skill:perception") found = await noticeHidden(store, room, me, total);
+        }
+      }
+      return reply({ ok: true, found: found.length });
+    }
+
+    // Use an attack or a spell on some targets: the server rolls everything (attacks against armor class, targets' own saving throws,
+    // damage), spends the spell slot, records the result for the DM, and sends the numbers floating over the tokens.
+    if (route === "act" && req.method === "POST") {
+      const b = await req.json().catch(() => ({}));
+      const state = await store.get(`state/${room}`, { type: "json" });
+      if (!state) return fail(404, "No table with that code.");
+      const dm = await isDm(req.headers.get("x-pin"));
+      const actorEnt = (state.ents || []).find((e) => e.id === cleanId(b.actor));
+      if (!actorEnt) return fail(400, "That character isn't on the map.");
+      if (actorEnt.type === "pc") { if (!(await mayActAs(actorEnt.id))) return needLogin(); }
+      else if (!dm) return fail(401, "Only the DM can do that for a creature.");
+      const ids = [...new Set((Array.isArray(b.targets) ? b.targets : []).map(cleanId))].slice(0, 12);
+      const tEnts = ids.map((id) => (state.ents || []).find((e) => e.id === id)).filter((e) => e && (dm || !e.hidden));
+      const mode = b.mode === "adv" || b.mode === "dis" ? b.mode : "normal";
+      const bestiary = readBestiary(await store.get(`bestiary/${room}`, { type: "json" }));
+      const creatureOf = (e) => (e.cid ? bestiary.creatures.find((c) => c.id === e.cid) : null);
+      let action, casterLevel = 1, slotUsed = null, sheetBox = null;
+      const spellFor = async (name, level) => { const entry = await spellEntry(store, room, req, name); return { entry, profile: classifySpell(entry || { name, level, desc: "" }) }; };
+
+      if (actorEnt.type === "pc") {
+        const key = await sheetKeyFor(actorEnt.id);
+        const raw = await store.get(key, { type: "json" });
+        const sheet = readSheet(raw), pc = pcFromSheet(sheet);
+        if (b.kind === "attack") {
+          const a = sheet.char.attacks.find((x) => x.id === cleanId(b.ref));
+          if (!a) return fail(400, "That attack isn't on the character sheet.");
+          const bonus = parseBonus(a.bonus);
+          if (!Number.isFinite(bonus)) return fail(400, `Enter ${a.name || "the attack"}'s bonus on the sheet first, like +5.`);
+          action = { type: "attack", name: a.name || "Attack", bonus, damage: parseDamageText(a.damage) };
+        } else if (b.kind === "spell") {
+          const sp = sheet.spells.find((x) => x.id === cleanId(b.ref)) || sheet.spells.find((x) => x.name.toLowerCase() === String(b.ref || "").toLowerCase());
+          if (!sp) return fail(400, "That spell isn't on the character sheet.");
+          const { profile } = await spellFor(sp.name, sp.level);
+          action = { type: "spell", name: sp.name, level: sp.level, profile, dc: pc.spellDC, atk: pc.spellAtk, spellMod: pc.spellMod };
+          casterLevel = pc.level;
+          if (sp.level > 0) {
+            const want = Math.min(9, Math.max(sp.level, Math.round(Number(b.slot)) || sp.level));
+            const slot = sheet.slots[want];
+            if (!slot || slot.used >= slot.max) return fail(409, `No spell slots of level ${want} left.`);
+            slotUsed = want;
+          }
+        } else return fail(400, "Choose an attack or a spell.");
+        sheetBox = { key, raw, sheet };
+      } else {
+        const cr = creatureOf(actorEnt);
+        if (!cr) return fail(400, "That token isn't linked to a stat block in the library, so it has nothing to use.");
+        if (b.kind === "attack") {
+          const a = (cr.attacks || []).find((x) => x.id === cleanId(b.ref));
+          if (!a) return fail(400, "That attack isn't on the stat block.");
+          action = { type: "attack", name: a.name || "Attack", bonus: a.bonus, damage: a.damage || [], save: a.save, noRoll: a.kind === "other" || a.kind === "save" };
+        } else if (b.kind === "spell") {
+          const sc = cr.spellcasting;
+          const sp = (sc?.spells || []).find((x) => x.id === cleanId(b.ref)) || (sc?.spells || []).find((x) => x.name.toLowerCase() === String(b.ref || "").toLowerCase());
+          if (!sp) return fail(400, "That spell isn't on the stat block.");
+          const { profile } = await spellFor(sp.name, sp.level);
+          const mod = sc.ability ? modOf(cr.abilities?.[sc.ability]) : 0;
+          action = { type: "spell", name: sp.name, level: sp.level, profile, dc: sc.dc, atk: sc.atk, spellMod: mod };
+          casterLevel = sc.level || 1;
+        } else return fail(400, "Choose an attack or a spell.");
+      }
+
+      const infoOf = async (e) => {
+        let ac = e.ac !== undefined && e.ac !== null && e.ac !== "" && Number.isFinite(Number(e.ac)) ? Number(e.ac) : null;
+        const save = {};
+        if (e.type === "pc") {
+          const p = pcFromSheet(readSheet(await store.get(await sheetKeyFor(e.id), { type: "json" })));
+          if (ac == null) ac = p.ac;
+          Object.assign(save, p.save);
+        } else {
+          const cr = creatureOf(e);
+          if (cr) {
+            if (ac == null) ac = parseAc(cr.ac);
+            for (const k of ABIL) save[k] = modOf(cr.abilities?.[k]);
+            Object.assign(save, parseSaveList(cr.saves));
+          }
+        }
+        return { id: e.id, name: e.name, ac, save };
+      };
+      const targets = [];
+      for (const e of tEnts) targets.push(await infoOf(e));
+      const res = resolveAction({ actor: { id: actorEnt.id, name: actorEnt.name }, action, targets, rng: serverRng, mode, slot: slotUsed, casterLevel });
+      res.kind = b.kind;
+      if (slotUsed && sheetBox) {   // spend the slot
+        const sh = sheetBox.sheet;
+        sh.slots[slotUsed].used += 1;
+        const out = { ...cleanSheet(sh), rev: (sheetBox.sheet.rev || 0) + 1 };
+        await store.setJSON(sheetBox.key, sheetBox.raw?.name ? { ...out, name: sheetBox.raw.name } : out);
+        res.slotLeft = sh.slots[slotUsed].max - sh.slots[slotUsed].used;
+      }
+      const rec = { id: Math.random().toString(36).slice(2, 9), t: Date.now(), by: actorEnt.type === "pc" ? "player" : "dm", res, applied: {} };
+      if (state.autoApply) await applyRecord(store, room, rec);
+      const acts = (await store.get(`acts/${room}`, { type: "json" })) || { list: [] };
+      await store.setJSON(`acts/${room}`, { list: [rec, ...(acts.list || [])].slice(0, 40) });
+
+      // the numbers over the tokens: the attacker's roll, or each target's own saving throw (green for a hit or a save, red for a miss or a fail)
+      const shown = rec.by === "player" || b.visible === true ? "all" : "dm";
+      const fx = [];
+      for (const s of res.shots) {
+        if (res.type === "save") { const t = res.targets.find((x) => x.id === s.target); fx.push({ token: s.target, text: String(t.save.total), kind: t.outcome === "saved" ? "save" : t.outcome === "failed" ? "fail" : "neutral", vis: shown }); }
+        else if (s.roll) fx.push({ token: actorEnt.id, text: String(s.roll.total), kind: s.outcome === "hit" || s.outcome === "crit" ? "hit" : s.outcome === "miss" ? "miss" : "neutral", vis: shown });
+      }
+      for (const t of res.targets) {
+        if (res.type === "attack" && t.save) fx.push({ token: t.id, text: String(t.save.total), kind: t.save.success ? "save" : "fail", vis: shown });
+        if (res.type === "heal") fx.push({ token: t.id, text: `+${t.healed}`, kind: "heal", vis: shown });
+      }
+      await pushFx(store, room, fx);
+
+      // a line in the roll feed
+      if (shown === "all" || rec.by === "player") {
+        const first = res.shots.find((s) => s.roll)?.roll?.total ?? res.damageRoll?.total ?? res.heal?.total ?? 0;
+        const line = { who: str(actorEnt.name, 30), label: str(`${res.name} on ${res.targets.map((t) => t.name).join(", ") || "no one"}`, 44), total: Math.round(first), detail: str(summarize(res, { forPlayers: true }), 120), nat: null, dm: rec.by === "dm", r: Math.random().toString(36).slice(2, 6) };
+        await store.set(`${feedPrefix(room)}${String(Date.now()).padStart(13, "0")}-${Buffer.from(JSON.stringify(line)).toString("base64url")}`, "1");
+        const keys = await feedKeys(store, room);
+        if (keys.length > FEED_MAX) await Promise.all(keys.slice(0, keys.length - FEED_MAX).map((k) => store.delete(k)));
+      }
+      return reply({ ok: true, id: rec.id, result: dm ? res : playerView(res), applied: rec.applied });
+    }
+
+    // The DM's record of what was used, and applying its damage or healing to the tokens.
+    if (route === "acts" && req.method === "GET") {
+      const denied = await dmOnly();
+      if (denied) return denied;
+      return reply({ acts: ((await store.get(`acts/${room}`, { type: "json" })) || { list: [] }).list });
+    }
+    if (route === "actapply" && req.method === "POST") {
+      const denied = await dmOnly();
+      if (denied) return denied;
+      const b = await req.json().catch(() => ({}));
+      const acts = (await store.get(`acts/${room}`, { type: "json" })) || { list: [] };
+      const rec = acts.list.find((x) => x.id === cleanId(b.id));
+      if (!rec) return fail(404, "That action is no longer in the record.");
+      const only = b.target ? [cleanId(b.target)] : null;
+      const done = await applyRecord(store, room, rec, only);
+      await store.setJSON(`acts/${room}`, acts);
+      return reply({ ok: true, applied: done });
     }
 
     if (route === "feed" && (req.method === "GET" || req.method === "DELETE")) {
@@ -998,7 +1249,8 @@ export default async (req) => {
     }
 
     if (route === "pings" && req.method === "GET") {
-      return reply({ now: Date.now(), pings: await livePings(store, room) });
+      const fxAll = await readFx(store, room);
+      return reply({ now: Date.now(), pings: await livePings(store, room), fx: fxSince(fxAll, Number(url.searchParams.get("fx") || 0), await isDm(req.headers.get("x-pin"))), fxSeq: fxAll.seq });
     }
     if (route === "ping" && req.method === "POST") {
       const b = await req.json().catch(() => ({}));

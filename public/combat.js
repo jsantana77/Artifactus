@@ -155,7 +155,7 @@ export function mountCombatPanel(el, h) {
 
   function cardFor({ it, e }, d, turnId, single = false) {
     const c = e.cid ? d.creatures.get(e.cid) : null;
-    const inner = e.type === "pc" ? pcCardHTML(e, d.sheets.get(e.id), { spells: true, lib: d.spellLib, open: openMap, key: e.id, openByDefault: single ? ["spells"] : [] }) : c ? cardHTML(c, { title: false, lib: d.spellLib, open: openMap, key: e.id, who: e.name, openByDefault: single ? ["spells"] : [] }) : basicCardHTML(e, d.library);
+    const inner = e.type === "pc" ? pcCardHTML(e, d.sheets.get(e.id), { spells: true, lib: d.spellLib, open: openMap, key: e.id, openByDefault: single ? ["spells"] : [] }) : c ? cardHTML(c, { title: false, lib: d.spellLib, open: openMap, key: e.id, who: e.name, tid: e.id, openByDefault: single ? ["spells"] : [] }) : basicCardHTML(e, d.library);
     return `<section class="cs-card ${turnId === e.id ? "turn" : ""} ${e.down ? "down" : ""}" data-id="${e.id}">
       <div class="cs-top">
         <span class="dot" style="--c:${TYPES[e.type]?.color || "#999"}"></span>

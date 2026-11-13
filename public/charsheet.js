@@ -95,7 +95,7 @@ const STATUS = { saved: "Saved", saving: "Saving…", error: "Offline, retrying�
 
 /* hp: optional { get() -> {hp, maxHp, pending}, set(hp, maxHp) -> Promise<string> }. Players use it to
    send HP changes to the DM. The DM edits HP from the initiative list, so passes nothing. */
-export function mountChar(root, store, { hp = null, onRoll = null } = {}) {
+export function mountChar(root, store, { hp = null, onRoll = null, onUse = null } = {}) {
   const open = new Set(["basics", "combat", "abilities"]);
   let hpMsg = "";
   let lastRoll = null, how = "normal", lastAtk = null;   // the roll bar: last result, advantage setting, last attack roll
@@ -193,6 +193,7 @@ export function mountChar(root, store, { hp = null, onRoll = null } = {}) {
         <div class="atkbtns">
           <button class="rollbtn" type="button" data-act="rollatk">Attack</button>
           <button class="rollbtn" type="button" data-act="rolldmg">Damage</button>
+          ${onUse ? '<button class="rollbtn use" type="button" data-act="useatk" title="Choose who to attack, and the dice roll themselves">On a target…</button>' : ""}
           <button class="x" type="button" data-act="delatk" aria-label="Remove attack">×</button>
         </div>
       </div>`).join("")}
@@ -267,7 +268,7 @@ export function mountChar(root, store, { hp = null, onRoll = null } = {}) {
     try { navigator.vibrate?.(15); } catch { /* not every device can */ }
     if (!onRoll) return;
     try {
-      const note = await onRoll({ label: info.label, total: info.total, detail: info.detail, nat: info.nat === 20 || info.nat === 1 ? info.nat : null, kind: info.kind });
+      const note = await onRoll({ label: info.label, total: info.total, detail: info.detail, nat: info.nat === 20 || info.nat === 1 ? info.nat : null, kind: info.kind, key: info.key });
       if (typeof note === "string" && lastRoll === info) { lastRoll = { ...info, note }; refreshRollbar(); }
     } catch { /* sharing is best-effort: the roll itself already happened */ }
   }
@@ -279,7 +280,7 @@ export function mountChar(root, store, { hp = null, onRoll = null } = {}) {
     const tag = tagFor();
     const r = d20(m, how);
     how = "normal";
-    announce({ label: label + tag, total: r.total, detail: r.detail, nat: r.nat, kind: key === "init" ? "initiative" : "check" });
+    announce({ label: label + tag, total: r.total, detail: r.detail, nat: r.nat, kind: key === "init" ? "initiative" : "check", key });
   }
 
   function rollAttack(id) {
@@ -359,6 +360,7 @@ export function mountChar(root, store, { hp = null, onRoll = null } = {}) {
     if (!b) return;
     const act = b.dataset.act;
     if (act === "rollatk" || act === "rolldmg") { (act === "rollatk" ? rollAttack : rollDamage)(b.closest("[data-id]").dataset.id); return; }
+    if (act === "useatk") { const a = charOf(store.view).attacks.find((x) => x.id === b.closest("[data-id]").dataset.id); if (a) onUse(a); return; }
     if (act === "deathroll") { rollDeathSave(); return; }
     if (act === "skill") {
       const k = b.dataset.k;

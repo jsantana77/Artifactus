@@ -772,9 +772,26 @@ dialog .statcard:focus-visible{outline:1px solid var(--line);outline-offset:0}
 .sc-abil .rbtn.sm{margin-top:.2rem;white-space:nowrap}
 .statcard .cardbar{margin:.3rem 0 .5rem;display:grid;gap:.4rem}
 .cardbar .rollctl{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;justify-content:space-between}
-.rshare[aria-pressed="true"]{border-color:var(--brass);color:var(--brass)}
+.rshare[aria-pressed="true"]{border-color:var(--brass);background:var(--brass);color:var(--brass-ink)}   /* (gold button, dark text, like every other pressed button) */
 .sprolls{display:inline-flex;gap:.3rem;flex-wrap:wrap;margin-left:.3rem;vertical-align:middle}
 .pcs-sp>summary{display:block}
+
+/* ---------- numbers floating over tokens, and Perception DCs ---------- */
+.fxnum{position:absolute;z-index:30;pointer-events:none;transform:translate(-50%,-100%);margin-left:var(--dx,0);
+  font-family:var(--sans);font-weight:800;line-height:1;font-size:calc(30px * var(--inv,1));
+  text-shadow:0 0 calc(3px * var(--inv,1)) #000,0 calc(2px * var(--inv,1)) calc(5px * var(--inv,1)) rgba(0,0,0,.95);
+  animation:fxfloat 3.6s ease-out forwards}
+.fx-hit,.fx-save,.fx-heal{color:var(--ok)}
+.fx-miss,.fx-fail{color:var(--bad)}
+.fx-neutral{color:#fff}
+.fx-found{color:var(--brass)}
+@keyframes fxfloat{0%{opacity:0;margin-top:calc(10px * var(--inv,1)) }8%{opacity:1}72%{opacity:1}100%{opacity:0;margin-top:calc(-56px * var(--inv,1))}}
+@media (prefers-reduced-motion:reduce){.fxnum{animation:fxfade 3.6s linear forwards}@keyframes fxfade{0%,80%{opacity:1}100%{opacity:0}}}
+.tok[data-dc]:not([data-dc=""])::after{content:"DC " attr(data-dc);position:absolute;left:50%;top:-4px;transform:translate(-50%,-100%);
+  font:700 calc(13px * var(--inv,1))/1 var(--sans);padding:calc(2px * var(--inv,1)) calc(5px * var(--inv,1));border-radius:calc(5px * var(--inv,1));
+  background:rgba(0,0,0,.78);color:var(--brass);white-space:nowrap;pointer-events:none}
+.tok.noticed{outline:calc(3px * var(--inv,1)) solid var(--brass);outline-offset:calc(2px * var(--inv,1));animation:noticepulse 1.6s ease-in-out infinite}
+@keyframes noticepulse{50%{outline-color:transparent}}
 
 /* ---------- locations tied to beats and objectives, and leveling ---------- */
 .lkk{display:inline-block;font-size:.7rem;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--brass);border:1px solid rgba(212,170,92,.5);border-radius:99px;padding:0 .45rem;margin-right:.3rem;vertical-align:middle}
@@ -792,3 +809,32 @@ dialog .statcard:focus-visible{outline:1px solid var(--line);outline-offset:0}
 .lvrow legend{display:flex;align-items:baseline;gap:.5rem}
 .lvrow legend small{color:var(--mute);font-family:var(--sans);font-weight:400}
 .lvrow .hint{margin:0}
+
+/* ---------- using an attack or a spell on targets ---------- */
+dialog.actdlg{max-width:min(34rem,94vw);width:100%;padding:1.1rem 1.2rem;border:1px solid var(--line);border-radius:16px;background:var(--panel2,#1d2433);color:var(--text)}
+dialog.actdlg::backdrop{background:rgba(5,8,14,.62)}
+.actform h2{margin:0 0 .15rem;font-size:1.35rem}
+.acttargets{max-height:min(42vh,22rem);overflow:auto;display:grid;gap:.4rem;padding:.1rem}
+.actgrp{border:1px solid var(--line);border-radius:10px;padding:.3rem .6rem .5rem;margin:0;min-width:0}
+.actgrp legend{font-size:.8rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--mute);padding:0 .3rem}
+.acttgt{display:flex;align-items:center;gap:.55rem;min-height:44px;cursor:pointer;flex-wrap:wrap}
+.acttgt input{width:1.25rem;height:1.25rem;flex:0 0 auto}
+.acttgt .dot{width:.8rem;height:.8rem;border-radius:50%;flex:0 0 auto}
+.acttgt small{color:var(--mute);margin-left:auto}
+.actres{list-style:none;margin:.5rem 0;padding:0;display:grid;gap:.45rem}
+.actres li{line-height:1.4}
+.actres .ok,.num.ok{color:var(--ok)}
+.actres .bad,.num.bad{color:var(--bad)}
+.actres .num{font-size:1.15em}
+.msg.bad{color:var(--bad);min-height:1.2em;margin:.3rem 0 0}
+.rollbtn.use{border-color:var(--brass);color:var(--brass)}
+
+/* ---------- the DM's record of actions, and Perception notes ---------- */
+.acts{list-style:none;margin:0;padding:0;display:grid;gap:.6rem}
+.actrow{border:1px solid var(--line);border-radius:10px;padding:.5rem .65rem;background:rgba(255,255,255,.02)}
+.actrow .acthead{display:flex;gap:.4rem;flex-wrap:wrap;align-items:baseline}
+.actrow .acthead small{color:var(--mute);margin-left:auto}
+.actrow .actres{margin:.3rem 0}
+.actapply{display:flex;gap:.4rem;flex-wrap:wrap}
+.dcnote{color:var(--brass);font-weight:700}
+.noticed-tag{color:var(--brass)}

@@ -73,7 +73,7 @@ const dmgPart = (d) => {
 };
 export const damageHTML = (list) => (list || []).map(dmgPart).filter(Boolean).join(" plus ");
 
-export function attackHTML(a) {
+export function attackHTML(a, ctx = {}) {
   const bits = [];
   const label = KIND_LABEL[a.kind];
   const name = a.name || "Attack";
@@ -87,7 +87,8 @@ export function attackHTML(a) {
   if (label && saveBit) bits.push(saveBit);   // an attack that also forces a save (a poisoned sting): the save follows the damage
   if (hasSave && String(a.save.onSave || "").trim()) bits.push(esc(a.save.onSave.trim()));
   const notes = String(a.notes || "").trim();
-  return `<p class="sc-feat sc-atk" data-atk="${esc(a.id)}"><b><i>${esc(a.name || "Attack")}.</i></b> ${bits.join(" · ")}${notes ? ` <span class="sc-more">${rollifyText(notes, name)}</span>` : ""}</p>`;
+  const use = ctx.tid ? ` <button type="button" class="rbtn sm use" data-use="attack" data-ref="${esc(a.id)}" title="Use it on a target: the dice roll themselves">Use…</button>` : "";
+  return `<p class="sc-feat sc-atk" data-atk="${esc(a.id)}"><b><i>${esc(a.name || "Attack")}.</i></b> ${bits.join(" · ")}${use}${notes ? ` <span class="sc-more">${rollifyText(notes, name)}</span>` : ""}</p>`;
 }
 
 /* ----- one special ability or action ----- */
@@ -115,7 +116,8 @@ export function spellRow(s, lib, key, openMap, rolls = null) {
   if (String(s.note || "").trim()) parts.push(`<p class="pcs-note"><b>Note:</b> ${esc(s.note)}</p>`);
   if (!parts.length) return `<div class="pcs-sp"><b>${esc(s.name)}</b></div>`;
   const k = `${key}:sp:${s.name}`;
-  const rb = rolls && e ? spellRollButtons(e, s.name, rolls) : "";
+  const useBtn = rolls?.use && e ? `<button type="button" class="rbtn sm use" data-use="spell" data-ref="${esc(s.id || s.name)}" title="Cast it on a target: the dice roll themselves">Use…</button>` : "";
+  const rb = (rolls && e ? spellRollButtons(e, s.name, rolls) : "") + useBtn;
   return `<details class="pcs-sp" data-k="${esc(k)}" ${openMap?.get(k) ? "open" : ""}><summary><b>${esc(s.name)}</b>${meta ? ` <small>${esc(meta)}</small>` : ""}${rb ? ` <span class="sprolls">${rb}</span>` : ""}</summary><div class="pcs-spbody">${parts.join("")}</div></details>`;
 }
 
@@ -149,7 +151,7 @@ export function spellcastingHTML(sc, opts = {}) {
       return [l === 0 ? "Cantrips (at will)" : `${ord(l)} level${n ? ` (${n} slot${n === 1 ? "" : "s"})` : ""}`, by.get(l)];
     });
   }
-  const list = groups.map(([h, items]) => `<div class="pcs-group"><h4 class="pcs-lv">${esc(h)}</h4>${items.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" })).map((s) => spellRow(s, opts.lib, key, opts.open, { atk: sc.atk, abilMod: opts.abilMod || 0 })).join("")}</div>`).join("");
+  const list = groups.map(([h, items]) => `<div class="pcs-group"><h4 class="pcs-lv">${esc(h)}</h4>${items.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" })).map((s) => spellRow(s, opts.lib, key, opts.open, { atk: sc.atk, abilMod: opts.abilMod || 0, use: !!opts.tid })).join("")}</div>`).join("");
   return `<div class="sc-cast"><p class="sc-feat"><b><i>${sc.innate ? "Innate Spellcasting" : "Spellcasting"}.</i></b> ${intro}</p>${list}</div>`;
 }
 
@@ -161,7 +163,7 @@ export function structuredSections(c, opts = {}) {
   const abilMod = sa ? Math.floor(((Number(c.abilities?.[sa]) || 10) - 10) / 2) : 0;   // for "heals 1d8 + your spellcasting modifier"
   return {
     traits: spellcastingHTML(c.spellcasting, { ...opts, abilMod }) + feats("trait"),
-    actions: (c.attacks || []).map(attackHTML).join("") + feats("action"),
+    actions: (c.attacks || []).map((a) => attackHTML(a, opts)).join("") + feats("action"),
     bonus: feats("bonus"),
     reactions: feats("reaction"),
     legendary: feats("legendary"),
