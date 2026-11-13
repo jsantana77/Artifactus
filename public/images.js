@@ -4,6 +4,11 @@
 export const MAP_ACCEPT = "image/*,video/mp4,video/webm";
 export const VIDEO_MAX = 4 * 1024 * 1024;   // the hosting platform only lets a request carry about 6 MB once encoded
 
+/* Map pictures keep as many pixels as fit in the same upload limit, so there's more to see when you zoom in. */
+export const IMAGE_MAX_BYTES = 4 * 1024 * 1024;
+export const MAP_MAX_SIDE = 4096;     // pixels along the longest side
+export const MAP_MAX_PIXELS = 14e6;   // phones can't draw a much bigger picture than this in one go
+
 const videoType = (f) => (f.type && f.type.startsWith("video/") ? f.type.split(";")[0]
   : /\.webm$/i.test(f.name || "") ? "video/webm" : /\.(mp4|m4v)$/i.test(f.name || "") ? "video/mp4" : "");
 export const isVideoFile = (f) => !!videoType(f);
@@ -32,6 +37,17 @@ function frameToJpeg(source, width) {
   return new Promise((r) => c.toBlob(r, "image/jpeg", 0.72));
 }
 
+/* Does this browser really save WebP? (Some, like Safari, quietly hand back a PNG instead.) WebP files are about a quarter
+   smaller than JPEG at the same look, which means more pixels in the same upload. */
+let webpTest = null;
+const webpWorks = () => (webpTest ||= new Promise((resolve) => {
+  try {
+    const c = document.createElement("canvas");
+    c.width = c.height = 2;
+    c.toBlob((b) => resolve(!!b && b.type === "image/webp"), "image/webp", 0.8);
+  } catch { resolve(false); }
+}));
+
 export async function compressMap(file) {
   const vt = videoType(file);
   if (vt) {
@@ -48,18 +64,21 @@ export async function compressMap(file) {
     return { blob, w, h, kind: "video", thumb };
   }
   const bmp = await createImageBitmap(file);
-  let scale = Math.min(1, 2400 / Math.max(bmp.width, bmp.height));
-  let q = 0.86;
-  for (let i = 0; i < 7; i++) {
-    const w = Math.round(bmp.width * scale), h = Math.round(bmp.height * scale);
+  const type = (await webpWorks()) ? "image/webp" : "image/jpeg";
+  // Never enlarge, never go past the size a phone can draw, and keep it within the upload limit.
+  let scale = Math.min(1, MAP_MAX_SIDE / Math.max(bmp.width, bmp.height), Math.sqrt(MAP_MAX_PIXELS / (bmp.width * bmp.height)));
+  for (let i = 0; i < 9; i++) {
+    const w = Math.max(1, Math.round(bmp.width * scale)), h = Math.max(1, Math.round(bmp.height * scale));
     const c = document.createElement("canvas");
     c.width = w; c.height = h;
     const ctx = c.getContext("2d");
     ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);
     ctx.drawImage(bmp, 0, 0, w, h);
-    const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", q));
-    if (blob && blob.size <= 3.4 * 1024 * 1024) return { blob, w, h, kind: "image" };
-    q = Math.max(0.6, q - 0.08);
+    // Best quality first; only give up quality, then pixels, when the file is still too big.
+    for (const q of i === 0 ? [0.9, 0.82, 0.74] : [0.85, 0.76]) {
+      const blob = await new Promise((r) => c.toBlob(r, type, q));
+      if (blob && blob.size <= IMAGE_MAX_BYTES) return { blob, w, h, kind: "image" };
+    }
     scale *= 0.85;
   }
   throw new Error("That map is too large even after shrinking. Try a smaller image.");

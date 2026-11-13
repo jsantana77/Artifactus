@@ -18,7 +18,7 @@ const openSections = new Set(["overview", "beats"]);
 
 const SECTIONS = [
   { key: "overview", title: "Overview and strong start" },
-  { key: "beats", title: "Beats and scenes", add: "Add a beat", blank: () => ({ id: uid(), text: "", kind: "scene", note: "", done: false }) },
+  { key: "beats", title: "Beats and scenes", add: "Add a beat", blank: () => ({ id: uid(), text: "", kind: "scene", note: "", done: false, locId: "" }) },
   { key: "secrets", title: "Secrets and clues", add: "Add a secret or clue", blank: () => ({ id: uid(), text: "", done: false }) },
   { key: "places", title: "Locations", add: "Add a place", blank: () => ({ id: uid(), name: "", notes: "", locId: "" }) },
   { key: "npcs", title: "NPCs", add: "Add an NPC", blank: () => ({ id: uid(), name: "", role: "", wants: "", secret: "", voice: "", notes: "" }) },
@@ -63,13 +63,25 @@ export function mountPlan(container, plan, opts) {
 
   /* ----- one item of each kind ----- */
   const ITEM = {
-    beats: (b) => `
+    beats: (b) => {
+      const locs = getLocations?.() || [];
+      const known = b.locId && locs.some((l) => l.id === b.locId);
+      return `
       <div class="plrow">
         <label class="check pldone"><input type="checkbox" data-pf="done" ${b.done ? "checked" : ""}><span class="sr">Played</span></label>
         <select data-pf="kind" aria-label="Kind of beat">${kindOptions(BEAT_KINDS, b.kind)}</select>${actions()}
       </div>
       ${ta("text", b.text, 2, "What happens, or what you want to hit", 1500)}
-      <details class="plnote" ${b.note ? "open" : ""}><summary>Notes</summary>${ta("note", b.note, 3, "Details, options, how it could go", 3000)}</details>`,
+      <div class="plrow">
+        <select data-pf="locId" aria-label="Where this beat happens (a saved map)">
+          <option value="">No place tied to this beat</option>
+          ${locs.map((l) => `<option value="${l.id}" ${b.locId === l.id ? "selected" : ""}>${esc(l.name)}</option>`).join("")}
+          ${b.locId && !known ? `<option value="${b.locId}" selected>(map no longer saved)</option>` : ""}
+        </select>
+        ${known ? '<button class="btn small" type="button" data-pgoto>Go there</button>' : ""}
+      </div>
+      <details class="plnote" ${b.note ? "open" : ""}><summary>Notes</summary>${ta("note", b.note, 3, "Details, options, how it could go", 3000)}</details>`;
+    },
 
     secrets: (b) => `
       <div class="plrow">
