@@ -11,6 +11,7 @@ import { mountCombatPanel, pcCardHTML, pcStats, partyGlanceHTML, bindOpenState }
 import { refreshRollBars } from "./creaturerolls.js";
 import { openActionDialog, resultHTML, ord as ordinal } from "./actions.js";
 import { merge3, applyInPlace, clone, deepEq } from "./merge.js";
+import { openPanoOverlay } from "./panoview.js";
 import { mountLocations } from "./locations.js";
 
 const popDocs = new Set();   // the pages of any pop-out windows (the map, the combat window) that are open
@@ -292,6 +293,7 @@ function renderMap() {
   if (persp) { $("#gridCols").value = state.grid.cols ?? 10; $("#gridRows").value = state.grid.rows ?? 18; }
   $("#snapOn").checked = !!state.grid.snap;
   $("#mapOn").checked = !!state.mapOn;
+  renderPanoBar();
   $("#autoApply").checked = !!state.autoApply;
   $("#freeExplore").checked = !!state.freeExplore;
   $("#autoApprove").checked = !!state.autoApprove;
@@ -2040,6 +2042,54 @@ function renderFeed(feed) {
 }
 
 $("#feedOn").onchange = (e) => { state.feedOn = e.target.checked; changed(); };
+/* ---------- look-around photos ---------- */
+/* A 360° photo is shown to the players by saving which one (and where it is pointing) into the table, so it syncs like everything else. */
+let dmPano = null;
+const panoBlob = async (id, rev) => {
+  const r = await fetch(`/api/pano/${room}/${id}?v=${rev}`, { headers: { "x-pin": pin } });
+  if (!r.ok) throw new Error("That panorama couldn't be loaded.");
+  return r.blob();
+};
+function openDmPano(pano, { preview = false } = {}) {
+  dmPano?.close();
+  const shared = !preview && state.pano?.id === pano.id ? state.pano : null;
+  const ov = openPanoOverlay({
+    doc: document, title: pano.name, dm: true, preview, shared, load: () => panoBlob(pano.id, pano.rev),
+    onShow: (view) => showPanoToPlayers(pano, view),
+    onPoint: (view, { live }) => { if (state.pano?.id !== pano.id) return; state.pano = { ...state.pano, yaw: view.yaw, pitch: view.pitch, fov: view.fov, t: Date.now() }; changed(); },
+    onFollow: (on) => { if (state.pano) { state.pano = { ...state.pano, follow: on, t: Date.now() }; changed(); } },
+    onHide: () => hidePano(),
+    onClose: () => { if (dmPano === ov) dmPano = null; },
+  });
+  ov.preview = preview;
+  dmPano = ov;
+}
+function showPanoToPlayers(pano, view = {}) {
+  state.pano = { id: pano.id, name: pano.name, rev: pano.rev, yaw: view.yaw ?? 0, pitch: view.pitch ?? 0, fov: view.fov ?? 90, follow: false, t: Date.now() };
+  changed();
+  openDmPano(pano);
+  toast(`Showing "${pano.name}" to the players.`);
+}
+function hidePano() {
+  if (!state.pano) return;
+  state.pano = null;
+  changed();
+  if (dmPano && !dmPano.preview) dmPano.close();
+}
+function renderPanoBar() {
+  const p = state.pano;
+  $("#panoBar").hidden = !p;
+  if (p) $("#panoName").textContent = p.name;
+  else if (dmPano && !dmPano.preview) dmPano.close();   // another screen hid it
+}
+$("#panoLook").onclick = () => {
+  const p = state.pano;
+  if (!p) return;
+  const known = (locs?.list() || []).flatMap((l) => l.panos || []).find((x) => x.id === p.id);
+  openDmPano(known || { id: p.id, name: p.name, rev: p.rev });
+};
+$("#panoHide").onclick = hidePano;
+
 /* ---------- using a creature's attacks and spells ---------- */
 /* From a stat block's "Use…": choose targets, and the server rolls it: attacks against armor class, the targets' own saves, damage. */
 async function dmUseAction({ kind, ref, tid }) {
@@ -2186,6 +2236,7 @@ $("#leave").onclick = () => {
       setLocalMap: (rev, url) => { localMap = { rev, url }; },
       links: (id) => locLinks.get(id) || [],
       jump: jumpToLink,
+      panos: { show: (p) => showPanoToPlayers(p), look: (p) => openDmPano(p, { preview: state.pano?.id !== p.id }), deleted: (p) => { if (state.pano?.id === p.id) hidePano(); } },
     });
     await locs.load();
     renderMap();

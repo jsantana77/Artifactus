@@ -129,6 +129,8 @@ const MAX_MAP = 4.6 * KB * KB;
 const MAX_FOG = 600 * KB;
 const MAX_IMG = 400 * KB;
 const MAX_THUMB = 150 * KB;
+const MAX_PANO = 4.6 * KB * KB;   // a 360° photo (twice as wide as it is tall), shrunk by the page to fit one request
+const MAX_PANOS = 60;             // per table
 const MAX_VIDEO = 4 * KB * KB;   // a looping video map; the hosting platform limits a request to about 6 MB once encoded for transfer
 
 /* Roll feed. Each roll is its own blob whose KEY carries the data, so one list call reads
@@ -357,7 +359,7 @@ async function acctFromToken(store, token) {
   return a && (await acctToken(a)) === `${id}.${sig}` ? a : null;
 }
 async function purgeRoom(store, room) {
-  const kinds = ["state", "map", "fog", "thumb", "img", "sub", "pcu", "mvreq", "pings", "roll", "sheet", "login", "lib", "camp", "bestiary", "locs", "own", "joinreq", "meta"];
+  const kinds = ["state", "map", "fog", "thumb", "img", "pano", "panothumb", "sub", "pcu", "mvreq", "pings", "roll", "sheet", "login", "lib", "camp", "bestiary", "locs", "own", "joinreq", "meta"];
   for (const k of kinds) {
     const { blobs } = await store.list({ prefix: `${k}/${room}` });
     await Promise.all(blobs.map((b) => store.delete(b.key)));
@@ -520,6 +522,10 @@ function cleanLocs(d) {
       grid: cleanGrid(l?.grid),
       fog: { on: !!l?.fog?.on, rev: num(l?.fog?.rev, 0, 9e15, 0) },
       tokens,
+      panos: (Array.isArray(l?.panos) ? l.panos : []).slice(0, 12).map((p) => ({
+        id: cleanId(p?.id) || Math.random().toString(36).slice(2, 9), name: str(p?.name, 60).trim() || "View",
+        w: num(p?.w, 0, 20000, 0), h: num(p?.h, 0, 20000, 0), rev: num(p?.rev, 0, 9e15, 0),
+      })),
     };
   });
   return { locations };
@@ -852,10 +858,25 @@ export default async (req) => {
       fog: { key: sid ? `fog/${room}/${sid}` : `fog/${room}`, max: MAX_FOG, type: /^image\/png/, fallback: "image/png" },
       thumb: { key: `thumb/${room}/${sid}`, max: MAX_THUMB, type: /^image\//, fallback: "image/jpeg" },
       img: { key: `img/${room}/${sid}`, max: MAX_IMG, type: /^image\//, fallback: "image/jpeg" },
+      pano: { key: `pano/${room}/${sid}`, max: MAX_PANO, type: /^image\/(jpeg|png|webp)/, fallback: "image/jpeg" },
+      panothumb: { key: `panothumb/${room}/${sid}`, max: MAX_THUMB, type: /^image\//, fallback: "image/jpeg" },
     }[route];
 
     if (assets) {
-      if ((route === "img" || route === "thumb") && !sid) return fail(400, "Missing id.");
+      if ((route === "img" || route === "thumb" || route === "pano" || route === "panothumb") && !sid) return fail(400, "Missing id.");
+      if (route === "pano" || route === "panothumb") {
+        // Look-around photos can show rooms the players haven't reached: they may only fetch the one the DM is showing right now.
+        const dm = await isDm(req.headers.get("x-pin"));
+        if (req.method === "GET" && !dm) {
+          if (route === "panothumb") return fail(401, "Only the DM can see that.");
+          const st = await store.get(`state/${room}`, { type: "json" });
+          if (!st?.pano || st.pano.id !== sid) return fail(404, "Not found.");
+        }
+        if (req.method === "PUT" && route === "pano" && dm) {
+          const held = (await store.list({ prefix: `pano/${room}/` })).blobs;
+          if (held.length >= MAX_PANOS && !held.some((b) => b.key === assets.key)) return fail(409, `A table can hold ${MAX_PANOS} look-around photos. Delete some first.`);
+        }
+      }
       if (req.method === "GET") {
         const r = await store.getWithMetadata(assets.key, { type: "arrayBuffer" });
         if (!r) return fail(404, "Not found.");

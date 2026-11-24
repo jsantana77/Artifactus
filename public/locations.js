@@ -187,6 +187,7 @@ export function mountLocations(root, ctx) {
       <div class="locact">
         <button class="btn small primary" type="button" data-act="load" ${isActive ? "disabled" : ""}>${isActive ? "Current" : "Go here"}</button>
         <button class="btn small" type="button" data-act="edit">Edit</button>
+        <button class="btn small" type="button" data-act="panos" title="360° photos of this place that you can show to the players">Look around${l.panos?.length ? ` (${l.panos.length})` : ""}</button>
       </div>
     </li>`;
 
@@ -266,6 +267,61 @@ export function mountLocations(root, ctx) {
     keys.set(loc.id, JSON.stringify(snapshotOf(S())));
     ctx.changed();
     render();
+  }
+
+  /* ----- look-around photos: 360° pictures of a place, shown to the players on request ----- */
+  function panosDialog(locId) {
+    const loc = byId(locId);
+    if (!loc) return;
+    loc.panos ||= [];
+    const msg = (t) => { const m = dlg.querySelector("[data-pm]"); if (m) m.textContent = t || ""; };
+    const draw = () => {
+      dlg.innerHTML = `<div class="panodlg"><h2>Look around: ${esc(loc.name)}</h2>
+        <p class="hint">360° photos of this place. You choose when the players see one, and they can look all around inside it. Use an ordinary 360 photo, twice as wide as it is tall: from a 360 camera, a phone's photo sphere, or a render.</p>
+        <ul class="panolist">${loc.panos.map((p) => `<li data-pid="${p.id}"><img class="panothumb" data-pt="${p.id}" alt="">
+          <div class="panoname"><input type="text" value="${esc(p.name)}" maxlength="60" aria-label="Name of this view" data-pn><small>${p.w} × ${p.h}</small></div>
+          <div class="panobtns"><button type="button" class="btn small" data-pv>Look</button><button type="button" class="btn small primary" data-ps>Show to players</button><button type="button" class="btn small danger ghost" data-pd>Delete</button></div></li>`).join("") || '<li class="empty">No views yet.</li>'}</ul>
+        <p class="msg bad" data-pm role="alert"></p>
+        <div class="dlg-actions"><label class="btn small primary" style="cursor:pointer">Add a 360° photo<input type="file" accept="image/*" hidden data-pu></label><button type="button" class="btn" data-close>Done</button></div></div>`;
+      dlg.querySelector("[data-close]").onclick = () => dlg.close();
+      dlg.querySelector("[data-pu]").onchange = async (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) await addPano(f); };
+      for (const li of dlg.querySelectorAll("[data-pid]")) {
+        const p = loc.panos.find((x) => x.id === li.dataset.pid);
+        li.querySelector("[data-pn]").onchange = (e) => { p.name = e.target.value.trim().slice(0, 60) || "View"; saveDoc(); };
+        li.querySelector("[data-pv]").onclick = () => { dlg.close(); ctx.panos?.look?.(p, loc); };
+        li.querySelector("[data-ps]").onclick = () => { dlg.close(); ctx.panos?.show?.(p, loc); };
+        li.querySelector("[data-pd]").onclick = async (e) => {
+          const b = e.currentTarget;
+          if (!b.dataset.armed) { b.dataset.armed = "1"; b.textContent = "Delete it?"; setTimeout(() => { if (b.isConnected) { delete b.dataset.armed; b.textContent = "Delete"; } }, 3000); return; }
+          loc.panos = loc.panos.filter((x) => x.id !== p.id);
+          for (const kind of ["pano", "panothumb"]) call(`${kind}/${room}/${p.id}`, { method: "DELETE", pin }).catch(() => {});
+          ctx.panos?.deleted?.(p);
+          await saveDoc(); render(); draw();
+        };
+        // the little preview comes from the server (it is only for the DM)
+        fetch(`/api/panothumb/${room}/${p.id}?v=${p.rev}`, { headers: { "x-pin": pin } }).then((r) => (r.ok ? r.blob() : null)).then((b) => { if (b) { const im = li.querySelector("img"); im.src = URL.createObjectURL(b); } }).catch(() => {});
+      }
+    };
+    async function addPano(file) {
+      msg("");
+      if (loc.panos.length >= 12) { msg("A place can hold 12 views. Delete one first."); return; }
+      try {
+        msg("Preparing the photo…");
+        const out = await compressMap(file);
+        if (out.kind === "video") throw new Error("That's a video. Use a 360° photo.");
+        if (Math.abs(out.w / out.h - 2) > 0.1 && !confirm(`This picture is ${out.w} × ${out.h}. A 360° photo should be twice as wide as it is tall, or it will look stretched. Use it anyway?`)) { msg(""); return; }
+        const id = uid(), rev = Date.now();
+        msg("Uploading…");
+        await call(`pano/${room}/${id}`, { method: "PUT", body: out.blob, pin });
+        await call(`panothumb/${room}/${id}`, { method: "PUT", body: await makeThumb(out.blob, 320), pin });
+        loc.panos.push({ id, name: (file.name || "View").replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ").trim().slice(0, 60) || "View", w: out.w, h: out.h, rev });
+        await saveDoc();
+        render();
+        draw();
+      } catch (err) { msg(err.message || "That photo couldn't be added."); }
+    }
+    draw();
+    if (!dlg.open) dlg.showModal();
   }
 
   /* ----- switching ----- */
@@ -396,6 +452,7 @@ export function mountLocations(root, ctx) {
       ctx.changed();
     }
     for (const kind of ["map", "fog", "thumb"]) call(`${kind}/${room}/${id}`, { method: "DELETE", pin }).catch(() => {});
+    for (const p of loc.panos || []) { for (const kind of ["pano", "panothumb"]) call(`${kind}/${room}/${p.id}`, { method: "DELETE", pin }).catch(() => {}); ctx.panos?.deleted?.(p); }
     await saveDoc();
     render();
   }
@@ -449,6 +506,7 @@ export function mountLocations(root, ctx) {
     else if (act === "add") addDialog();
     else if (act === "load" && id) switchDialog(id);
     else if (act === "edit" && id) editDialog(id);
+    else if (act === "panos" && id) panosDialog(id);
     else if (act === "savecurrent") saveCurrent();
   });
 

@@ -1,4 +1,5 @@
 import { openActionDialog } from "./actions.js";
+import { openPanoOverlay } from "./panoview.js";
 import { pcFromSheet, parseBonus } from "./actionrules.js";
 import { call, esc, TYPES, MapView, uid, pingColor, PING_TTL, getAccount } from "./common.js";
 import { openPopout } from "./popout.js";
@@ -780,6 +781,31 @@ updateWho();
 let timer;
 const schedule = () => { clearTimeout(timer); timer = setTimeout(poll, 2000); };
 
+/* ---------- the DM's look-around photo ---------- */
+/* When the DM shows a 360° photo it opens full screen for everyone. Players can look all around in it (unless the DM has locked the
+   view), go back to the map, and come back with the Look around button. If the DM points everyone somewhere new, it glides there. */
+let panoOv = null, panoSeen = "";
+function openPano(p) {
+  panoOv?.close();
+  const ov = openPanoOverlay({
+    doc: document, title: p.name, dm: false, shared: p,
+    load: async () => { const r = await fetch(`/api/pano/${room}/${p.id}?v=${p.rev}`); if (!r.ok) throw new Error("Your DM isn't showing that any more."); return r.blob(); },
+  });
+  ov.key = `${p.id}:${p.rev}`;
+  panoOv = ov;
+}
+function syncPano() {
+  const p = st.pano, btn = $("#panoBtn");
+  if (btn) btn.hidden = !p;
+  if (!p) { panoOv?.close(); panoOv = null; panoSeen = ""; return; }
+  if (panoOv && !panoOv.isClosed() && panoOv.key === `${p.id}:${p.rev}`) { panoOv.applyShared(p); return; }
+  const stamp = `${p.id}:${p.rev}:${p.t}`;
+  if (panoSeen === stamp) return;   // they went back to the map for this view: leave them be
+  panoSeen = stamp;
+  openPano(p);
+}
+$("#panoBtn").onclick = () => { if (st?.pano) openPano(st.pano); };
+
 /* ---------- using an attack or a spell on a target ---------- */
 /* The dice are rolled by the server: attacks against the target's armor class, the target's own saving throw against your spell save DC,
    damage, and the spell slot. Numbers float over the tokens as soon as it's done. */
@@ -823,6 +849,7 @@ async function poll() {
         addPing({ id: p.id, x: p.x, y: p.y, label: p.pid && p.pid === me ? (session?.name || p.who) : p.who, color: pingColor(p.pid || p.who) }, PING_TTL - (r.now - p.t));
       }
       render();
+      syncPano();
       showFx(r.fx, r.now);
       fxSeq = r.fxSeq ?? fxSeq;
       if (first || !session) maybeAskLogin();

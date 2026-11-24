@@ -838,3 +838,27 @@ dialog.actdlg::backdrop{background:rgba(5,8,14,.62)}
 .actapply{display:flex;gap:.4rem;flex-wrap:wrap}
 .dcnote{color:var(--brass);font-weight:700}
 .noticed-tag{color:var(--brass)}
+
+/* ---------- 360° look-around ---------- */
+.panoov{position:fixed;inset:0;z-index:2000;background:#000;display:flex;flex-direction:column}
+.panostage{flex:1;min-height:0;position:relative;outline:none;overflow:hidden}
+.pano-canvas{width:100%;height:100%;display:block;cursor:grab;touch-action:none}
+.pano-canvas:active{cursor:grabbing}
+.pano-locked .pano-canvas{cursor:default}
+.pano-flat{width:100%;height:100%;overflow:auto}
+.pano-flat img{height:100%;width:auto;max-width:none;display:block}
+.panobar{position:absolute;top:0;left:0;right:0;display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;padding:calc(.6rem + env(safe-area-inset-top,0px)) .8rem .6rem;background:linear-gradient(rgba(0,0,0,.72),rgba(0,0,0,0));pointer-events:none}
+.panobar>*{pointer-events:auto}
+.panotitle{font-family:var(--serif);font-size:1.15rem;color:#fff;text-shadow:0 1px 4px #000}
+.panomsg{color:var(--brass);font-size:.9rem;flex:1 1 8rem}
+.panoact{display:flex;gap:.45rem;flex-wrap:wrap;margin-left:auto}
+.panohint{position:absolute;bottom:calc(.7rem + env(safe-area-inset-bottom,0px));left:50%;transform:translateX(-50%);color:rgba(255,255,255,.75);font-size:.85rem;text-shadow:0 1px 3px #000;pointer-events:none;text-align:center;max-width:92vw}
+#panoBar{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;padding:.35rem 1rem;background:rgba(212,170,92,.14);border-bottom:1px solid rgba(212,170,92,.45);grid-column:1/-1}
+#panoBar[hidden]{display:none}
+#panoBar b{color:var(--brass)}
+.panolist{list-style:none;margin:.5rem 0;padding:0;display:grid;gap:.6rem;max-height:50vh;overflow:auto}
+.panolist li{display:grid;grid-template-columns:96px 1fr;gap:.2rem .7rem;align-items:center;border:1px solid var(--line);border-radius:10px;padding:.4rem}
+.panothumb{width:96px;height:48px;object-fit:cover;border-radius:6px;background:#0b0f18}
+.panoname input{width:100%}
+.panoname small{color:var(--mute)}
+.panobtns{grid-column:1/-1;display:flex;gap:.4rem;flex-wrap:wrap}
